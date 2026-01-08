@@ -1,4 +1,4 @@
-#include <stdio.h>          // For printf
+include <stdio.h>          // For printf
 #include <fcntl.h>          // For open() and O_RDWR
 #include <sys/ioctl.h>      // For ioctl()
 #include <linux/i2c-dev.h>  // For I2C_SLAVE constant
@@ -8,7 +8,7 @@
 #include <stdint.h>         // For uint8_t
 #include <stdlib.h>         // For malloc
 
-#define "monitor_driver.h"
+#include "monitor_driver.h"
 #define I2C_DEVICE_FILE     "/dev/i2c-1"
 
 /**
@@ -126,11 +126,42 @@ void write_block(uint8_t device_addr , uint8_t reg_addr , uint8_t *data , int le
 }
 
 
-void cmc_transmit_data(uint8_t *user_payload , uint8_t payload_len) {
-  // CALCULATE THE FULL SIZE OF THE SIMPLE PROTOCOL FRAME 
-  // FRAME [1A][CF][LEN][PAYLOAD...][CHECKSUM]
-  // TOTAL = 2 + 1 + PAYLOAD LENGTH 
+/**
+ * Implements the CMC "Simple Protocol" (Manual Page 15).
+ * Wraps your data with Header, Length, and Checksum.
+ */
+void cmc_transmit_data(uint8_t *user_payload, uint8_t payload_len) {
+    // 1. Calculate the TOTAL size of the Simple Protocol frame
+    // Frame = [1A] [CF] [Len] [Payload...] [Checksum]
+    // Total = 2 + 1 + payload_len + 1 = payload_len + 4
+    int total_frame_len = payload_len + 4;
+    
+    // Allocate memory for the envelope
+    uint8_t *frame = (uint8_t*)malloc(total_frame_len);
+    
+    // --- BUILD THE HEADER ---
+    frame[0] = 0x1A;            // Preamble Byte 1 (Fixed)
+    frame[1] = 0xCF;            // Preamble Byte 2 (Fixed)
+    
+    // --- BUILD THE LENGTH ---
+    // Rule: "0 means 1 byte". So we subtract 1.
+    frame[2] = payload_len - 1; 
+
+    // --- COPY THE PAYLOAD ---
+    // Copy your custom protocol data into the frame
+    memcpy(&frame[3], user_payload, payload_len);
+    
+    // --- BUILD THE CHECKSUM ---
+    // Rule: Sum of payload bytes (ignoring overflow)
+    uint8_t checksum = 0;
+    for (int i = 0; i < payload_len; i++) {
+        checksum += user_payload[i];
+    }
+    frame[total_frame_len - 1] = checksum; // Put at the very end
+
+    // --- SEND TO I2C DRIVER ---
+    write_block(I2C_ADDR_CMC, CMC_REG_TX_DATA, frame, total_frame_len);
+
+    // Clean up
+    free(frame);
 }
-
-
-
