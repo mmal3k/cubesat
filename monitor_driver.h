@@ -3,8 +3,6 @@
 
 #include <stdint.h> // We need this for uint8_t
 
-// Constants needed by both files
-#define INA_DATA_CHAR_LEN 2 
 
 // Function Prototypes (The "Public Interface")
 void read_register(const uint8_t device_addr, const uint8_t reg, uint8_t buffer[INA_DATA_CHAR_LEN]);
