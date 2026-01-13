@@ -3,7 +3,7 @@
 
 #include <stdint.h> // We need this for uint8_t
 
-#define I2C_ADDR_CMC 0x25
+#define I2C_ADDR_CMC 0x27
 
 typedef enum {
     // --- Configuration Registers ---

@@ -39,6 +39,7 @@
 
 
 void monitor_cmc(void) {
+    
     uint8_t buffer[2];
     printf("--- Starting CMC I2C Connection Test ---\n");
     read_register_8bit(I2C_ADDR_CMC, CMC_REG_FIRMWARE_VER, buffer);
@@ -78,7 +79,6 @@ void monitor_cmc(void) {
 }
 
 int main(void) {
-    printf("Test de la connection en I2C entre la Q7 et la CMC\n");
     monitor_cmc();
     return 0;
 }

@@ -1,4 +1,4 @@
-include <stdio.h>          // For printf
+#include <stdio.h>          // For printf
 #include <fcntl.h>          // For open() and O_RDWR
 #include <sys/ioctl.h>      // For ioctl()
 #include <linux/i2c-dev.h>  // For I2C_SLAVE constant
@@ -16,10 +16,14 @@ include <stdio.h>          // For printf
  * @param device_addr: The hex address of the sensor (0x25 for CMC)
  * @param file_descriptor: A pointer to store the "ID" of the open file
  */
-void open_i2c(uint8_t device_addr , int *file_descriptor){
+void  open_i2c(uint8_t device_addr , int *file_descriptor){
+  if (file_descriptor == NULL){
+    fprintf(stderr,"File descriptor is Null\n");
+    abort();
+  }
   char filename[20];
   sprintf(filename , "%s" , I2C_DEVICE_FILE) ;
-
+  
   // OPEN THE FILE (READ/WRITE MODE)
   *file_descriptor = open(filename , O_RDWR);
 
@@ -29,7 +33,8 @@ void open_i2c(uint8_t device_addr , int *file_descriptor){
   }
 
   // CONFIGURE THE FILE 
-  // the <linux/i2c-dev.h> provide the I2C_SLAVE 
+  // the <linux/i2c-dev.h> provide the I2C_SLAVE
+  
   if(ioctl(*file_descriptor , I2C_SLAVE , device_addr) < 0) {
     printf("[Error] Failed to acquire bus access and/or talk to slave.\n");
     exit(1);
@@ -65,15 +70,13 @@ void read_i2c(uint8_t *buffer , int length , int file_descriptor) {
  * 2. Read the Data (2 bytes)
  */
 void read_register_16bit(uint8_t device_addr , uint8_t reg_addr , uint8_t *data_buffer) {
-  int file ;
-  uint8_t write_buf[1];
+  int file = -1 ;
 
   // SETUP 
-  open_i2c(device_addr , file);
+  open_i2c(device_addr , &file);
 
   // TELL THE CHIP WHICH REGISTER WE WANT
-  write_buf[0] = reg_addr;
-  write_i2c_with_error_code(write_buf , 1 , file);
+  write_i2c_with_error_code(&reg_addr , 1 , file);
 
   // READ THE ANSWER (2 BYTES)
   read_i2c(data_buffer , 2 , file);
@@ -83,20 +86,18 @@ void read_register_16bit(uint8_t device_addr , uint8_t reg_addr , uint8_t *data_
 }
 
 void read_register_8bit(uint8_t device_addr , uint8_t reg_addr , uint8_t *data_buffer) {
-  int file ;
-  uint8_t write_buf[1];
+  int file = -1;
 
   // SETUP 
-  open_i2c(device_addr , file);
-
+  open_i2c(device_addr , &file);
+  
   // TELL THE CHIP WHICH REGISTER WE WANT
-  write_buf[0] = reg_addr;
-  write_i2c_with_error_code(write_buf , 1 , file);
+  write_i2c_with_error_code(&reg_addr , 1 , file);
 
   // READ THE ANSWER (2 BYTES)
   read_i2c(data_buffer , 1 , file);
 
-  // CLEANUP
+  // // CLEANUP
   close_i2c(&file);
 }
 
