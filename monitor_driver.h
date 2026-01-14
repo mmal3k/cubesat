@@ -77,6 +77,25 @@ typedef enum {
 #define IDX_CRC_LSB      10  // CRC Low  (Placed BEFORE Data)
 #define IDX_DATA_START   11  // Data starts here
 
+
+typedef enum {
+    // Uplink (Ground -> Satellite)
+    PID_CMD_CONTROL = 0x10,
+    PID_PING        = 0x11,
+
+
+    // Downlink (Satellite -> Ground)
+    PID_TELEMETRY_HK    = 0x50,  // Housekeeping (Status Report)
+    
+    PID_SCI_IMG   = 0x60,  // Science Data (Files/Images)
+    PID_SCI_TXT   = 0x61,  // Science Data (Files/Text)
+
+    PID_ACK             = 0xAA,  // Acknowledge (Command received OK)
+    PID_ERROR           = 0xEE   // Error Report
+
+
+} PacketType ;
+
 /**
  * Reads a single byte (8-bit) from a specific register.
  * Usage: Reading CMC Temperature (Reg 0x0F)

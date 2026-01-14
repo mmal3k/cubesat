@@ -11,6 +11,11 @@
 #include "monitor_driver.h"
 #define I2C_DEVICE_FILE     "/dev/i2c-1"
 
+#define MAX_PAYLOAD_SIZE    (MAX_PACKET_SIZE - HEADER_SIZE)
+
+
+static uint16_t sequence_id = 0 ;
+
 /**
  * Opens the I2C bus and connects to a specific slave address.
  * @param device_addr: The hex address of the sensor (0x25 for CMC)
@@ -165,4 +170,60 @@ void cmc_transmit_data(uint8_t *user_payload, uint8_t payload_len) {
 
     // Clean up
     free(frame);
+}
+
+
+void send_data (PacketType type , uint16_t payload_length , uint8_t *data){
+  uint8_t packet[MAX_PACKET_SIZE];
+
+  uint16_t frag_total =  (payload_length + MAX_PAYLOAD_SIZE - 1)/ MAX_PAYLOAD_SIZE;
+
+  packet[IDX_TYPE]    = (uint8_t) type ; 
+  
+  packet[IDX_SEQ_LSB] = (sequence_id >> 8) & 0xFF;
+  packet[IDX_SEQ_MSB] = sequence_id & 0xFF ;
+
+  packet[IDX_FRAG_TOT_LSB] =(frag_total>> 8) & 0xFF;
+  packet[IDX_FRAG_TOT_MSB] = (frag_total) & 0xFF;
+
+  packet[IDX_FRAG_ID_LSB] =(frag_id>> 8) & 0xFF;
+  packet[IDX_FRAG_ID_MSB] = (frag_id) & 0xFF;
+
+  uint32_t offset = 0 ;
+  for(uint16_t frag_id = 0 ; frag_id <= frag_total ; frag_id++) {
+    // A. Determine size for THIS specific packet
+    // Normally 245, but the last one might be smaller (e.g., 5 bytes)
+    uint16_t current_chunk_size = MAX_PAYLOAD_SIZE;
+    
+    if ((payload_length - offset) < MAX_PAYLOAD_SIZE) {
+        current_chunk_size = (uint16_t)(payload_length- offset);
+    }
+        
+    // Payload Length (Size of THIS chunk, NOT total file)
+    packet[IDX_LEN_MSB] = (current_chunk_size >> 8) & 0xFF;
+    packet[IDX_LEN_LSB] = (current_chunk_size) & 0xFF;
+
+    // C. COPY DATA PAYLOAD
+    // We copy from data[offset] to packet[11]
+    if (current_chunk_size > 0 && data != NULL) {
+        memcpy(&packet[HEADER_SIZE], &data[offset], current_chunk_size);
+    } 
+    
+    // D. ZERO OUT CRC (Crucial Step)
+    packet[IDX_CRC_MSB] = 0x00;
+    packet[IDX_CRC_LSB] = 0x00;
+    
+    uint16_t total_packet_len = HEADER_SIZE + current_chunk_size;
+
+    // G. TRANSMIT
+    // Call your external hardware driver here
+    cmc_transmit_data(packet, total_packet_len);
+
+    // H. UPDATE STATE
+    offset += current_chunk_size;
+    sequence_id++; // Increment global counter for next packet 
+
+  }
+
+
 }
