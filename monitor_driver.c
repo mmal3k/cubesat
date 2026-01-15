@@ -131,6 +131,14 @@ void write_block(uint8_t device_addr , uint8_t reg_addr , uint8_t *data , int le
   free(buffer);
 }
 
+static uint16_t calculate_crc16(uint8_t *data , int len){
+  uint16_t crc = 0;
+  for(int i=0 ; i < len ; i++){
+    crc[i] += data[i];
+
+  }
+  return crc ;
+}
 
 /**
  * Implements the CMC "Simple Protocol" (Manual Page 15).
@@ -179,25 +187,26 @@ void send_data (PacketType type , uint16_t payload_length , uint8_t *data){
   uint16_t frag_total =  (payload_length + MAX_PAYLOAD_SIZE - 1)/ MAX_PAYLOAD_SIZE;
 
   packet[IDX_TYPE]    = (uint8_t) type ; 
-  
-  packet[IDX_SEQ_LSB] = (sequence_id >> 8) & 0xFF;
-  packet[IDX_SEQ_MSB] = sequence_id & 0xFF ;
 
   packet[IDX_FRAG_TOT_LSB] =(frag_total>> 8) & 0xFF;
   packet[IDX_FRAG_TOT_MSB] = (frag_total) & 0xFF;
 
-  packet[IDX_FRAG_ID_LSB] =(frag_id>> 8) & 0xFF;
-  packet[IDX_FRAG_ID_MSB] = (frag_id) & 0xFF;
-
   uint32_t offset = 0 ;
+
   for(uint16_t frag_id = 0 ; frag_id <= frag_total ; frag_id++) {
-    // A. Determine size for THIS specific packet
+    // a. determine size for this specific packet
     // Normally 245, but the last one might be smaller (e.g., 5 bytes)
     uint16_t current_chunk_size = MAX_PAYLOAD_SIZE;
     
     if ((payload_length - offset) < MAX_PAYLOAD_SIZE) {
         current_chunk_size = (uint16_t)(payload_length- offset);
     }
+
+    packet[IDX_SEQ_LSB] = (sequence_id >> 8) & 0xFF;
+    packet[IDX_SEQ_MSB] = sequence_id & 0xFF ;
+
+    packet[IDX_FRAG_ID_LSB] =(frag_id>> 8) & 0xFF;
+    packet[IDX_FRAG_ID_MSB] = (frag_id) & 0xFF;
         
     // Payload Length (Size of THIS chunk, NOT total file)
     packet[IDX_LEN_MSB] = (current_chunk_size >> 8) & 0xFF;
@@ -214,6 +223,10 @@ void send_data (PacketType type , uint16_t payload_length , uint8_t *data){
     packet[IDX_CRC_LSB] = 0x00;
     
     uint16_t total_packet_len = HEADER_SIZE + current_chunk_size;
+    uint16_t my_crc = calculate_crc16(packet, total_packet_len);
+
+    packet[IDX_CRC_MSB] = (my_crc >> 8) & 0xFF;
+    packet[IDX_CRC_LSB] = (my_crc) & 0xFF;
 
     // G. TRANSMIT
     // Call your external hardware driver here
@@ -222,8 +235,5 @@ void send_data (PacketType type , uint16_t payload_length , uint8_t *data){
     // H. UPDATE STATE
     offset += current_chunk_size;
     sequence_id++; // Increment global counter for next packet 
-
   }
-
-
 }
