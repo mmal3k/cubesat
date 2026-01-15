@@ -107,7 +107,7 @@ void read_register_8bit(uint8_t device_addr , uint8_t reg_addr , uint8_t *data_b
 }
 
 void write_block(uint8_t device_addr , uint8_t reg_addr , uint8_t *data , int length) {
-  int *file;
+  int file;
   
   // BUFFER THAT HOLDS [REG_ADDR] + [DATA] 
   // I2C SENDS REGISTER ADDR FIRST !
@@ -122,32 +122,65 @@ void write_block(uint8_t device_addr , uint8_t reg_addr , uint8_t *data , int le
   buffer[0] = reg_addr ;
   memcpy(&buffer[1], data , length); 
 
-  // SEND THE DATA
-  open_i2c(device_addr , file) ;
+  // send the data
+  open_i2c(device_addr , &file) ;
   write_i2c_with_error_code(buffer, length + 1, file);
   close_i2c(&file);
 
-  // RELEASE THE MEMORY 
+  // release the memory 
   free(buffer);
 }
 
 static uint16_t calculate_crc16(uint8_t *data , int len){
   uint16_t crc = 0;
   for(int i=0 ; i < len ; i++){
-    crc[i] += data[i];
+    crc += data[i];
 
   }
   return crc ;
 }
 
+
+void cmc_modem_init(){
+  int timeout = 100;
+  uint8_t buffer = 0;
+  printf("[Init] Configuring CMC Modem...\n");
+
+  // --- STEP 1: Configure Modem ---
+  // "Write to Modem Config (0x00) and set Uplink/Downlink to 1200bps/9600bps"
+ 
+  uint8_t config_val = 0x01; 
+  write_block(I2C_ADDR_CMC, CMC_REG_MODEM_CONFIG, &config_val, 1);
+
+  while(timeout > 0){
+    // --- STEP 2: Read Ready Signal Register---
+    // CHECK IF TR(THE FIRST BYTE) = 1
+    read_register_8bit(I2C_ADDR_CMC, CMC_REG_READY_SIG, &buffer);
+
+    if((buffer & 0x01) == 0x01){
+      printf("[Init] Modem Ready! (TR=1)\n");
+      return; // Success
+    }
+
+    printf("[Init] Waiting for TR... (Status: 0x%02X)\n", buffer);
+    timeout--;
+    delay_ms(50);
+  }
+  printf("[Init] Error: Modem Timed Out\n");
+}
 /**
- * Implements the CMC "Simple Protocol" (Manual Page 15).
- * Wraps your data with Header, Length, and Checksum.
+ * implements the cmc "simple protocol" (manual page 15).
+ * wraps your data with header, length, and checksum.
  */
 void cmc_transmit_data(uint8_t *user_payload, uint8_t payload_len) {
     // 1. Calculate the TOTAL size of the Simple Protocol frame
     // Frame = [1A] [CF] [Len] [Payload...] [Checksum]
     // Total = 2 + 1 + payload_len + 1 = payload_len + 4
+
+    cmc_modem_init();
+
+
+    prepare_transmit();
     int total_frame_len = payload_len + 4;
     
     // Allocate memory for the envelope
