@@ -5,8 +5,10 @@
 // Enfin on passe à la lecture des registres de Temperature et de Voltage pour enfin les printer sur notre terminal (celui du picocom XD )
 
 #include <stdio.h>
-#include <unistd.h>         // For sleep()
-#include "monitor_driver.h" // Includes I2C_ADDR_CMC and register definitions
+#include <unistd.h>
+#include <string.h>
+#include <stdint.h>
+#include "monitor_driver.h"
 
 // HOW HANDLE NEGATIVE VALUES WITH SHIFTING AND CASTING 
 // CMC BOARD MIXES 8-bit,12-bit,13-bit and 16-bit DATA TYPES 
@@ -73,12 +75,80 @@ void monitor_cmc(void) {
 
         printf("3.3V Rail: %.3f V\n", volt_real);
         printf("----------------------------------\n");
+        
+        uint8_t data_buf[2];
 
-        sleep(2);
+        data_buf[0] = 0x00;
+        data_buf[1] = 0xf0;
+
+        write_block(I2C_ADDR_CMC,CMC_REG_TX_FREQ_OFFSET,data_buf,2);
+
+        cmc_transmit_data(data_buf , 2);
+        
+        sleep(5);
+        
     }
 }
 
+
+void enable_beacon(void) {
+    uint8_t data ; 
+    data = 0x01;
+    write_block(I2C_ADDR_CMC , CMC_REG_I2C_TIMEOUT , &data , 1);
+
+    data = 10;
+    write_block(I2C_ADDR_CMC , CMC_REG_REC_TIMEOUT , &data , 1);
+
+    data = 0x01;
+    write_block(I2C_ADDR_CMC , CMC_REG_BEACON_CTRL , &data , 1);
+
+    printf("succeeded");
+}
+
+void test_voltage_under_load() {
+    uint8_t lock_reg = 0;
+    uint8_t volt_buf[2];
+    uint16_t volt_raw;
+    float voltage;
+
+    // 1. Set up for Transmit (0.5W)
+    uint8_t pwr = 0x02; 
+    write_block(I2C_ADDR_CMC, CMC_REG_PA_POWER, &pwr, 1);
+    
+    printf("--- POWER STRESS TEST ---\n");
+
+    while(1) {
+        // Read Lock Status
+        read_register_8bit(I2C_ADDR_CMC, CMC_REG_FREQ_LOCK, &lock_reg);
+        
+        // Read 3.3V Rail Voltage
+        read_register_16bit(I2C_ADDR_CMC, CMC_REG_VOLT_3V3, volt_buf);
+        volt_raw = (volt_buf[0] << 8) | volt_buf[1];
+        voltage = volt_raw * 0.004f; // Convert to Volts
+
+        printf("Lock: %d | Voltage: %.3f V\n", (lock_reg >> 1) & 0x01, voltage);
+
+        if (voltage < 3.25) {
+             printf("⚠️ WARNING: Voltage Drop Detected! Power Supply too weak.\n");
+        }
+        
+        // Try to transmit a small packet to trigger the load
+        uint8_t dummy[] = "TEST";
+        cmc_transmit_data(dummy, 4);
+        
+        sleep(1);
+    }
+}
+
+
+
 int main(void) {
-    monitor_cmc();
+    // enable_beacon();
+    // monitor_cmc();
+    test_voltage_under_load();
+
+
     return 0;
 }
+
+

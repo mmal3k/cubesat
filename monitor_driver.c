@@ -11,6 +11,11 @@
 #include "monitor_driver.h"
 #define I2C_DEVICE_FILE     "/dev/i2c-1"
 
+#define MAX_PAYLOAD_SIZE    (MAX_PACKET_SIZE - HEADER_SIZE)
+
+
+static uint16_t sequence_id = 0 ;
+
 /**
  * Opens the I2C bus and connects to a specific slave address.
  * @param device_addr: The hex address of the sensor (0x25 for CMC)
@@ -102,11 +107,11 @@ void read_register_8bit(uint8_t device_addr , uint8_t reg_addr , uint8_t *data_b
 }
 
 void write_block(uint8_t device_addr , uint8_t reg_addr , uint8_t *data , int length) {
-  int *file;
+  int file;
   
   // BUFFER THAT HOLDS [REG_ADDR] + [DATA] 
   // I2C SENDS REGISTER ADDR FIRST !
-  uint8_t *buffer = (uint8_t) malloc(length + 1); 
+  uint8_t *buffer = (uint8_t*) malloc(length + 1); 
 
   if(buffer == NULL) {
     printf("[Fatal] Memory allocation failed\n");
@@ -117,24 +122,63 @@ void write_block(uint8_t device_addr , uint8_t reg_addr , uint8_t *data , int le
   buffer[0] = reg_addr ;
   memcpy(&buffer[1], data , length); 
 
-  // SEND THE DATA
-  open_i2c(device_addr , file) ;
+  // send the data
+  open_i2c(device_addr , &file) ;
   write_i2c_with_error_code(buffer, length + 1, file);
   close_i2c(&file);
 
-  // RELEASE THE MEMORY 
+  // release the memory 
   free(buffer);
 }
 
+static uint16_t calculate_crc16(uint8_t *data , int len){
+  uint16_t crc = 0;
+  for(int i=0 ; i < len ; i++){
+    crc += data[i];
 
+  }
+  return crc ;
+}
+
+
+void cmc_modem_init(){
+  int timeout = 100;
+  uint8_t buffer = 0;
+  printf("[Init] Configuring CMC Modem...\n");
+
+  // --- STEP 1: Configure Modem ---
+  // "Write to Modem Config (0x00) and set Uplink/Downlink to 1200bps/9600bps"
+ 
+  uint8_t config_val = 0x01; 
+  write_block(I2C_ADDR_CMC, CMC_REG_MODEM_CONFIG, &config_val, 1);
+
+  while(timeout > 0){
+    // --- STEP 2: Read Ready Signal Register---
+    // CHECK IF TR(THE FIRST BYTE) = 1
+    read_register_8bit(I2C_ADDR_CMC, CMC_REG_READY_SIG, &buffer);
+
+    if((buffer & 0x01) == 0x01){
+      printf("[Init] Modem Ready! (TR=1)\n");
+      return; // Success
+    }
+
+    printf("[Init] Waiting for TR... (Status: 0x%02X)\n", buffer);
+    timeout--;
+    sleep(50);
+  }
+  printf("[Init] Error: Modem Timed Out\n");
+}
 /**
- * Implements the CMC "Simple Protocol" (Manual Page 15).
- * Wraps your data with Header, Length, and Checksum.
+ * implements the cmc "simple protocol" (manual page 15).
+ * wraps your data with header, length, and checksum.
  */
 void cmc_transmit_data(uint8_t *user_payload, uint8_t payload_len) {
     // 1. Calculate the TOTAL size of the Simple Protocol frame
     // Frame = [1A] [CF] [Len] [Payload...] [Checksum]
     // Total = 2 + 1 + payload_len + 1 = payload_len + 4
+
+    cmc_modem_init();
+
     int total_frame_len = payload_len + 4;
     
     // Allocate memory for the envelope
@@ -163,6 +207,66 @@ void cmc_transmit_data(uint8_t *user_payload, uint8_t payload_len) {
     // --- SEND TO I2C DRIVER ---
     write_block(I2C_ADDR_CMC, CMC_REG_TX_DATA, frame, total_frame_len);
 
+
+    printf("finished sending data\n");
     // Clean up
     free(frame);
+}
+
+
+void send_data (PacketType type , uint16_t payload_length , uint8_t *data){
+  uint8_t packet[MAX_PACKET_SIZE];
+
+  uint16_t frag_total =  (payload_length + MAX_PAYLOAD_SIZE - 1)/ MAX_PAYLOAD_SIZE;
+
+  packet[IDX_TYPE]    = (uint8_t) type ; 
+
+  packet[IDX_FRAG_TOT_LSB] =(frag_total>> 8) & 0xFF;
+  packet[IDX_FRAG_TOT_MSB] = (frag_total) & 0xFF;
+
+  uint32_t offset = 0 ;
+
+  for(uint16_t frag_id = 0 ; frag_id <= frag_total ; frag_id++) {
+    // a. determine size for this specific packet
+    // Normally 245, but the last one might be smaller (e.g., 5 bytes)
+    uint16_t current_chunk_size = MAX_PAYLOAD_SIZE;
+    
+    if ((payload_length - offset) < MAX_PAYLOAD_SIZE) {
+        current_chunk_size = (uint16_t)(payload_length- offset);
+    }
+
+    packet[IDX_SEQ_LSB] = (sequence_id >> 8) & 0xFF;
+    packet[IDX_SEQ_MSB] = sequence_id & 0xFF ;
+
+    packet[IDX_FRAG_ID_LSB] =(frag_id>> 8) & 0xFF;
+    packet[IDX_FRAG_ID_MSB] = (frag_id) & 0xFF;
+        
+    // Payload Length (Size of THIS chunk, NOT total file)
+    packet[IDX_LEN_MSB] = (current_chunk_size >> 8) & 0xFF;
+    packet[IDX_LEN_LSB] = (current_chunk_size) & 0xFF;
+
+    // C. COPY DATA PAYLOAD
+    // We copy from data[offset] to packet[11]
+    if (current_chunk_size > 0 && data != NULL) {
+        memcpy(&packet[HEADER_SIZE], &data[offset], current_chunk_size);
+    } 
+    
+    // D. ZERO OUT CRC (Crucial Step)
+    packet[IDX_CRC_MSB] = 0x00;
+    packet[IDX_CRC_LSB] = 0x00;
+    
+    uint16_t total_packet_len = HEADER_SIZE + current_chunk_size;
+    uint16_t my_crc = calculate_crc16(packet, total_packet_len);
+
+    packet[IDX_CRC_MSB] = (my_crc >> 8) & 0xFF;
+    packet[IDX_CRC_LSB] = (my_crc) & 0xFF;
+
+    // G. TRANSMIT
+    // Call your external hardware driver here
+    cmc_transmit_data(packet, total_packet_len);
+
+    // H. UPDATE STATE
+    offset += current_chunk_size;
+    sequence_id++; // Increment global counter for next packet 
+  }
 }

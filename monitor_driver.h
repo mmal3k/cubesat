@@ -59,6 +59,42 @@ typedef enum {
 
 } cmc_register_t;
 
+// HEADER CONFIGURATION
+#define HEADER_SIZE         11
+#define MAX_PACKET_SIZE     256 
+
+//--- BYTE OFFSETS ---
+#define IDX_TYPE         0   // Packet Type (PID)
+#define IDX_SEQ_MSB      1   // Sequence ID High Byte
+#define IDX_SEQ_LSB      2   // Sequence ID Low Byte
+#define IDX_FRAG_ID_MSB  3   // Fragment ID High
+#define IDX_FRAG_ID_LSB  4   // Fragment ID Low
+#define IDX_FRAG_TOT_MSB 5   // Total Fragments High
+#define IDX_FRAG_TOT_LSB 6   // Total Fragments Low
+#define IDX_LEN_MSB      7   // Payload Length High
+#define IDX_LEN_LSB      8   // Payload Length Low
+#define IDX_CRC_MSB      9   // CRC High (Placed BEFORE Data)
+#define IDX_CRC_LSB      10  // CRC Low  (Placed BEFORE Data)
+#define IDX_DATA_START   11  // Data starts here
+
+
+typedef enum {
+    // Uplink (Ground -> Satellite)
+    PID_CMD_CONTROL = 0x10,
+    PID_PING        = 0x11,
+
+
+    // Downlink (Satellite -> Ground)
+    PID_TELEMETRY_HK    = 0x50,  // Housekeeping (Status Report)
+    
+    PID_SCI_IMG   = 0x60,  // Science Data (Files/Images)
+    PID_SCI_TXT   = 0x61,  // Science Data (Files/Text)
+
+    PID_ACK             = 0xAA,  // Acknowledge (Command received OK)
+    PID_ERROR           = 0xEE   // Error Report
+
+
+} PacketType ;
 
 /**
  * Reads a single byte (8-bit) from a specific register.
@@ -88,5 +124,9 @@ void write_block(uint8_t device_addr, uint8_t reg_addr, uint8_t *data, int lengt
  * 5. Sends everything using write_block()
  */
 void cmc_transmit_data(uint8_t *user_payload, uint8_t payload_len);
+
+
+
+
 
 #endif 
