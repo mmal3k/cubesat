@@ -125,7 +125,18 @@ void write_block(uint8_t device_addr, uint8_t reg_addr, uint8_t *data, int lengt
  */
 void cmc_transmit_data(uint8_t *user_payload, uint8_t payload_len);
 
+/**
+ * Checks register 0x1B to see how many bytes are waiting to be read.
+ */
+uint16_t cmc_check_rx_available();
 
+/**
+ * Reads data from register 0x1D, verifies the 0x1A 0xCF headers and checksum.
+ * @param output_buffer: Pointer to where you want the clean data
+ * @param max_len: Size of your buffer
+ * @return: Number of bytes received, or -1 if error.
+ */
+int cmc_receive_frame(uint8_t *output_buffer, int max_len);
 
 
 

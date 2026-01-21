@@ -270,3 +270,115 @@ void send_data (PacketType type , uint16_t payload_length , uint8_t *data){
     sequence_id++; // Increment global counter for next packet 
   }
 }
+
+void read_register_block(uint8_t device_addr, uint8_t reg_addr, uint8_t *data_buffer, int length) {
+    int file = -1;
+
+    // 1. SETUP 
+    open_i2c(device_addr, &file);
+
+    // 2. WRITE REGISTER ADDRESS (Pointer)
+    // We tell the CMC: "I want to read from register reg_addr"
+    write_i2c_with_error_code(&reg_addr, 1, file);
+
+    // 3. READ N BYTES
+    // Now we read the full frame
+    read_i2c(data_buffer, length, file);
+
+    // 4. CLEANUP
+    close_i2c(&file);
+}
+
+uint16_t cmc_check_rx_available() {
+    uint8_t raw_count[2];
+    uint16_t count = 0;
+
+    // Read 2 bytes from 0x1B
+    read_register_16bit(I2C_ADDR_CMC, CMC_REG_RX_BUF_COUNT, raw_count); //
+
+    // Convert Big Endian (Network order) to Little Endian (Host) if needed
+    // Usually I2C registers return MSB first.
+    count = (raw_count[0] << 8) | raw_count[1];
+
+    return count;
+}
+int cmc_receive_frame(uint8_t *output_buffer, int max_len) {
+    
+    // 1. Check if data is available (Procedure 14.2 Step 1 & 2)
+    uint16_t bytes_available = cmc_check_rx_available();
+    
+    if (bytes_available == 0) {
+        return 0; // No data, nothing to do
+    }
+
+    printf("[RX] Data detected! %d bytes waiting.\n", bytes_available);
+
+    // Safety check for malloc
+    if (bytes_available > 512) { 
+        printf("[RX] Error: Too much data (%d)\n", bytes_available);
+        return -1; 
+    }
+
+    // 2. Allocate temporary buffer for the RAW frame (with Headers 1A CF...)
+    uint8_t *raw_frame = (uint8_t*)malloc(bytes_available);
+    if (raw_frame == NULL) return -1;
+
+    // 3. Read the Data (Procedure 14.2 Step 3) -> Register 0x1D
+    read_register_block(I2C_ADDR_CMC, CMC_REG_RX_DATA, raw_frame, bytes_available); //
+
+    // --- DECODING LOGIC (Simple Protocol) ---
+    // Frame format expected: [0x1A] [0xCF] [Len] [Payload...] [Checksum]
+    
+    // A. Check Minimum Size (Header 2 + Len 1 + Checksum 1 = 4 bytes min)
+    if (bytes_available < 4) {
+        printf("[RX] Error: Frame too short.\n");
+        free(raw_frame);
+        return -1;
+    }
+
+    // B. Check Preamble (0x1A 0xCF)
+    if (raw_frame[0] != 0x1A || raw_frame[1] != 0xCF) {
+        printf("[RX] Error: Invalid Preamble (Got %02X %02X)\n", raw_frame[0], raw_frame[1]);
+        free(raw_frame);
+        return -1;
+    }
+
+    // C. Parsing Length
+    // Note: User's transmit code used: frame[2] = payload_len - 1;
+    // So here: payload_len = frame[2] + 1;
+    uint8_t stated_payload_len = raw_frame[2] + 1;
+
+    // Validate that the bytes_available matches what the header claims
+    // Total expected = 3 bytes (Head+Len) + payload + 1 byte (Sum)
+    if (bytes_available != (3 + stated_payload_len + 1)) {
+        printf("[RX] Warning: Size mismatch. Reg said %d, Packet implies %d\n", 
+               bytes_available, (4 + stated_payload_len));
+        // We continue carefully, using the smaller valid length
+    }
+
+    // D. Verify Checksum
+    // Sum of payload bytes
+    uint8_t calc_sum = 0;
+    int payload_start_idx = 3;
+    
+    for (int i = 0; i < stated_payload_len; i++) {
+        calc_sum += raw_frame[payload_start_idx + i];
+    }
+
+    uint8_t received_sum = raw_frame[bytes_available - 1]; // Checksum is at the very end
+
+    if (calc_sum != received_sum) {
+        printf("[RX] Error: Checksum Fail (Calc 0x%02X != Recv 0x%02X)\n", calc_sum, received_sum);
+        free(raw_frame);
+        return -1;
+    }
+
+    // E. Copy Payload to User Buffer
+    int bytes_to_copy = (stated_payload_len > max_len) ? max_len : stated_payload_len;
+    memcpy(output_buffer, &raw_frame[payload_start_idx], bytes_to_copy);
+
+    printf("[RX] Success! Received %d bytes of payload.\n", bytes_to_copy);
+
+    free(raw_frame);
+    return bytes_to_copy; // Return number of useful bytes
+}
