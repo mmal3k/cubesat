@@ -125,7 +125,14 @@ void write_block(uint8_t device_addr, uint8_t reg_addr, uint8_t *data, int lengt
  */
 void cmc_transmit_data(uint8_t *user_payload, uint8_t payload_len);
 
+void read_register_block(uint8_t device_addr, uint8_t reg_addr, uint8_t *data_buffer, int length);
 
+uint16_t cmc_check_rx_available();
+
+int cmc_receive_frame(uint8_t *output_buffer, int max_len); 
+
+
+int cmc_receive_data(uint8_t *output_buffer, int max_len);
 
 
 

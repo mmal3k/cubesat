@@ -90,64 +90,133 @@ void monitor_cmc(void) {
     }
 }
 
+void run_cmc_diagnostics(){
+    uint8_t buffer[2];
+    uint8_t status_lock = 0;
+    uint16_t fwd_power = 0;
+    uint16_t tx_offset = 0;
+
+    while(1){
+        read_register_8bit(I2C_ADDR_CMC , CMC_REG_FREQ_LOCK , &status_lock);
+
+        read_register_16bit(I2C_ADDR_CMC , CMC_REG_FREQ_LOCK , buffer);
+        fwd_power = (buffer[0] << 8) | buffer[1];
+
+        read_register_16bit(I2C_ADDR_CMC , CMC_REG_TX_FREQ_OFFSET , buffer);
+        tx_offset = (buffer[0] << 8) | buffer[1];
+
+
+        printf("[DIAG] Lock : %d | TX Offset : %d | Power : %d\n" , status_lock ,fwd_power , tx_offset);
+
+        sleep(5);
+    }
+}
+
 
 void enable_beacon(void) {
     uint8_t data ; 
+
     data = 0x01;
     write_block(I2C_ADDR_CMC , CMC_REG_I2C_TIMEOUT , &data , 1);
 
+
     data = 10;
     write_block(I2C_ADDR_CMC , CMC_REG_REC_TIMEOUT , &data , 1);
+
 
     data = 0x01;
     write_block(I2C_ADDR_CMC , CMC_REG_BEACON_CTRL , &data , 1);
 
     printf("succeeded");
+
 }
 
-void test_voltage_under_load() {
-    uint8_t lock_reg = 0;
-    uint8_t volt_buf[2];
-    uint16_t volt_raw;
-    float voltage;
+void force_transmission_test(){
+    uint8_t payload[] = "HELLO WORLD";
+    uint8_t buffer[2]; // For reading diagnostics
 
-    // 1. Set up for Transmit (0.5W)
-    uint8_t pwr = 0x02; 
+    printf("--- CONFIGURING RADIO ---\n");
+
+    // 1. Set Frequency Offset (256)
+    uint8_t data[2];
+    data[0]= 0x01; 
+    data[1]= 0x00; 
+    write_block(I2C_ADDR_CMC, CMC_REG_TX_FREQ_OFFSET, data, 2);
+
+    // 2. Set Modem Config
+    uint8_t mod_config = 0x01; 
+    write_block(I2C_ADDR_CMC, CMC_REG_MODEM_CONFIG, &mod_config, 1);
+
+    // 3. Set Power (0x00 = On, 0x03 = Inhibit/Off)
+    uint8_t pwr = 0x00; 
     write_block(I2C_ADDR_CMC, CMC_REG_PA_POWER, &pwr, 1);
-    
-    printf("--- POWER STRESS TEST ---\n");
 
-    while(1) {
-        // Read Lock Status
+    printf("--- STARTING LOOP ---\n");
+
+    while(1){
+        // A. READ DIAGNOSTICS BEFORE SENDING
+        uint8_t lock_reg = 0;
         read_register_8bit(I2C_ADDR_CMC, CMC_REG_FREQ_LOCK, &lock_reg);
         
-        // Read 3.3V Rail Voltage
-        read_register_16bit(I2C_ADDR_CMC, CMC_REG_VOLT_3V3, volt_buf);
-        volt_raw = (volt_buf[0] << 8) | volt_buf[1];
-        voltage = volt_raw * 0.004f; // Convert to Volts
+        // Extract the TX Lock bit (usually Bit 1)
+        int is_locked = (lock_reg >> 1) & 0x01; 
 
-        printf("Lock: %d | Voltage: %.3f V\n", (lock_reg >> 1) & 0x01, voltage);
-
-        if (voltage < 3.25) {
-             printf("⚠️ WARNING: Voltage Drop Detected! Power Supply too weak.\n");
+        // B. READ CURRENT DRAW (To see if PA is on)
+        // (Assuming you have a function or register for this, optional but helpful)
+        
+        printf("[STATUS] TX Lock: %d | Sending Packet... ", is_locked);
+        
+        if (is_locked == 0) {
+            printf("(WARNING: Radio not locked!)\n");
         }
-        
-        // Try to transmit a small packet to trigger the load
-        uint8_t dummy[] = "TEST";
-        cmc_transmit_data(dummy, 4);
-        
+
+        // C. TRANSMIT
+        cmc_transmit_data(payload, 11);
+        printf("Done\n");
+
         sleep(1);
+    }
+}
+void test_voltage_under_load() {
+    uint8_t buf[2];
+    float v33, c33;
+    uint8_t min_pwr = 0x00; // On force la puissance au minimum (à ajuster selon datasheet)
+
+    printf("\n--- FINAL DIAGNOSTIC TEST (LOW POWER MODE) ---\n");
+
+    while(1) {
+        // 1. Lire les capteurs
+        // read_register_16bit(I2C_ADDR_CMC, CMC_REG_VOLT_3V3, buf);
+        // v33 = ((buf[0] << 8) | buf[1]) * 0.004f;
+
+        // read_register_16bit(I2C_ADDR_CMC, CMC_REG_CURRENT_3V3, buf);
+        // c33 = (((buf[0] << 8) | buf[1]) * 0.001f) / 100.0f; 
+
+        // printf("3.3V Rail: %.3f V | Current: %.1f mA\n", v33, c33 * 1000.0f);
+
+        // // 2. FORCER LA PUISSANCE BASSE AVANT L'ENVOI
+        // // On écrit la puissance minimale pour essayer d'éviter le crash
+        // write_block(I2C_ADDR_CMC, CMC_REG_PA_POWER, &min_pwr, 1);
+
+        // printf("Tentative d'envoi (Puissance)...\n");
+        // uint8_t dummy[] = "TEST";
+        // cmc_transmit_data(dummy, 4);
+        
+        read_register_16bit(I2C_ADDR_CMC, CMC_REG_VOLT_3V3, buf);
+        v33 = ((buf[0] << 8) | buf[1]) * 0.004f;
+        printf("3.3V Rail: %.3f V \n", v33);
+        printf("------------------\n");
+
+
+        // 3. Pause longue pour voir si on survit au reset
+        sleep(2); 
     }
 }
 
 
-
 int main(void) {
-    // enable_beacon();
-    // monitor_cmc();
     test_voltage_under_load();
-
-
+    
     return 0;
 }
 
