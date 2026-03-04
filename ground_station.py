@@ -271,7 +271,7 @@ def main():
         elif line == 'quit':
             break
         else:
-            print("Unknown command. Try: ping | ack | cmd <text> | quit")
+            print("Unknown command. Try: ping | ack | cmd <text> | qUIt")
 
     conn.close()
     server.close()
