@@ -110,15 +110,15 @@ static uint16_t calculate_checksum(uint8_t *data, int len) {
     return sum;
 }
 
-void send_data(PacketType type, uint16_t payload_length, uint8_t *data) {
+void send_data(PacketType type, uint32_t payload_length, uint8_t *data) {
     uint8_t packet[MAX_PACKET_SIZE];
     uint16_t frag_total = (payload_length == 0) ? 1 :
-                          (payload_length + MAX_PAYLOAD_SIZE - 1) / MAX_PAYLOAD_SIZE;
+                          (uint16_t)((payload_length + MAX_PAYLOAD_SIZE - 1) / MAX_PAYLOAD_SIZE);
 
     for (uint16_t frag_id = 0; frag_id < frag_total; frag_id++) {
-        uint16_t offset     = frag_id * MAX_PAYLOAD_SIZE;
+        uint32_t offset     = (uint32_t)frag_id * MAX_PAYLOAD_SIZE;
         uint16_t chunk_size = (payload_length - offset < MAX_PAYLOAD_SIZE) ?
-                              (payload_length - offset) : MAX_PAYLOAD_SIZE;
+                              (uint16_t)(payload_length - offset) : MAX_PAYLOAD_SIZE;
 
         packet[IDX_TYPE]         = (uint8_t)type;
         packet[IDX_SEQ_MSB]      = (sequence_id >> 8) & 0xFF;

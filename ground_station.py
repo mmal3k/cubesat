@@ -7,6 +7,14 @@ Communicates with the Q7 using the custom packet protocol.
 import socket
 import threading
 import sys
+import io
+import os
+
+try:
+    from PIL import Image
+    _PIL_AVAILABLE = True
+except ImportError:
+    _PIL_AVAILABLE = False
 
 # --- Protocol constants ---
 HEADER_SIZE      = 11
@@ -139,6 +147,26 @@ def receive_packet(sock) -> dict:
     }
 
 
+# --- Image handler ---
+
+def _handle_image(data: bytes, seq_id: int):
+    filename = f"image_{seq_id}.bin"
+    with open(filename, 'wb') as f:
+        f.write(data)
+    print(f"     Image saved to {os.path.abspath(filename)}")
+
+    if not _PIL_AVAILABLE:
+        print("     (install Pillow to display: pip install Pillow)")
+        return
+
+    try:
+        img = Image.open(io.BytesIO(data))
+        print(f"     Displaying image: {img.width}x{img.height} {img.format}")
+        img.show()
+    except Exception as e:
+        print(f"     Could not display image: {e}")
+
+
 # --- Receive thread (with fragment reassembly) ---
 
 def receive_loop(sock):
@@ -173,11 +201,15 @@ def receive_loop(sock):
             crc_status = "OK" if pkt['crc_ok'] else "FAIL"
 
             print(f"\n[RX] [{type_name}] seq={seq_id} len={len(full_payload)} crc={crc_status}")
-            if full_payload:
+
+            if pkt_type == PID_SCI_IMG:
+                _handle_image(full_payload, seq_id)
+            elif full_payload:
                 try:
                     print(f"     {full_payload.decode('utf-8', errors='replace')}")
                 except Exception:
                     print(f"     (hex) {full_payload.hex()}")
+
             print("> ", end='', flush=True)
 
 
@@ -218,6 +250,8 @@ def main():
     print("  ack             - send an ACK")
     print("  cmd <text>      - send a CMD_CONTROL with a text payload")
     print("  quit            - disconnect")
+    print()
+    print("Received SCI_IMG packets are saved as image_<seq>.bin and displayed automatically.")
     print()
 
     while True:

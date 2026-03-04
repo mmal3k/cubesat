@@ -41,7 +41,7 @@ typedef struct {
 
 int  tcp_init_connection(const char *ip, uint16_t port);
 void tcp_close_connection(void);
-void send_data(PacketType type, uint16_t payload_length, uint8_t *data);
+void send_data(PacketType type, uint32_t payload_length, uint8_t *data);
 int  receive_packet(RawPacket *pkt);
 
 #endif

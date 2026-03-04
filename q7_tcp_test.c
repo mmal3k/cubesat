@@ -6,6 +6,44 @@
 
 #include "q7_tcp_driver.h"
 
+static int send_image(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "[IMG] Cannot open file: %s\n", path);
+        return -1;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long file_size = ftell(f);
+    rewind(f);
+
+    if (file_size <= 0) {
+        fprintf(stderr, "[IMG] File is empty\n");
+        fclose(f);
+        return -1;
+    }
+
+    uint8_t *buf = malloc((size_t)file_size);
+    if (!buf) {
+        fprintf(stderr, "[IMG] malloc failed\n");
+        fclose(f);
+        return -1;
+    }
+
+    if (fread(buf, 1, (size_t)file_size, f) != (size_t)file_size) {
+        fprintf(stderr, "[IMG] Read error\n");
+        free(buf);
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+
+    printf("[TX] Sending image: %s (%ld bytes)\n", path, file_size);
+    send_data(PID_SCI_IMG, (uint32_t)file_size, buf);
+    free(buf);
+    return 0;
+}
+
 static const char *packet_type_name(PacketType type) {
     switch (type) {
         case PID_CMD_CONTROL:  return "CMD_CONTROL";
@@ -20,11 +58,13 @@ static const char *packet_type_name(PacketType type) {
 }
 
 int main(int argc, char *argv[]) {
-    const char *ip   = "127.0.0.1";
-    uint16_t    port = 5000;
+    const char *ip       = "127.0.0.1";
+    uint16_t    port     = 5000;
+    const char *img_path = NULL;
 
-    if (argc >= 2) ip   = argv[1];
-    if (argc >= 3) port = (uint16_t)atoi(argv[2]);
+    if (argc >= 2) ip       = argv[1];
+    if (argc >= 3) port     = (uint16_t)atoi(argv[2]);
+    if (argc >= 4) img_path = argv[3];
 
     if (tcp_init_connection(ip, port) != 0) {
         fprintf(stderr, "Failed to connect to %s:%u\n", ip, (unsigned)port);
@@ -39,6 +79,11 @@ int main(int argc, char *argv[]) {
     uint8_t payload[] = "HELLO FROM Q7";
     printf("[TX] Sending TELEMETRY_HK: \"%s\"\n", payload);
     send_data(PID_TELEMETRY_HK, (uint16_t)(sizeof(payload) - 1), payload);
+
+    /* Send image if path provided */
+    if (img_path) {
+        send_image(img_path);
+    }
 
     /* Wait for packets from ground station */
     printf("[RX] Waiting for packets from ground station...\n");
