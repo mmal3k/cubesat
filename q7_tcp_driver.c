@@ -11,8 +11,6 @@
 
 #include "q7_tcp_driver.h"
 
-#define MAX_PAYLOAD_SIZE    (MAX_PACKET_SIZE - HEADER_SIZE)
-
 static uint16_t sequence_id = 0;
 static int tcp_sock = -1;
 
@@ -63,7 +61,7 @@ static ssize_t tcp_send_bytes(const uint8_t *data, size_t len) {
     size_t total_sent = 0;
 
     if (tcp_sock == -1) {
-        fprintf(stderr, "[TCP] Socket not initialized. Call tcp_init_connection() first.\n");
+        fprintf(stderr, "[TCP] Socket not initialized.\n");
         return -1;
     }
 
@@ -73,70 +71,124 @@ static ssize_t tcp_send_bytes(const uint8_t *data, size_t len) {
             perror("[TCP] send");
             return -1;
         }
-        if (n == 0) {
-            break;
-        }
+        if (n == 0) break;
         total_sent += (size_t)n;
     }
 
     return (ssize_t)total_sent;
 }
 
-static uint16_t calculate_crc16(uint8_t *data, int len) {
-    uint16_t crc = 0;
-    for (int i = 0; i < len; i++) {
-        crc += data[i];
+static ssize_t tcp_recv_bytes(uint8_t *buf, size_t len) {
+    size_t total = 0;
+
+    if (tcp_sock == -1) {
+        fprintf(stderr, "[TCP] Socket not initialized.\n");
+        return -1;
     }
-    return crc;
+
+    while (total < len) {
+        ssize_t n = recv(tcp_sock, buf + total, len - total, 0);
+        if (n < 0) {
+            perror("[TCP] recv");
+            return -1;
+        }
+        if (n == 0) {
+            fprintf(stderr, "[TCP] Connection closed by remote.\n");
+            return 0;
+        }
+        total += (size_t)n;
+    }
+
+    return (ssize_t)total;
+}
+
+static uint16_t calculate_checksum(uint8_t *data, int len) {
+    uint16_t sum = 0;
+    for (int i = 0; i < len; i++) {
+        sum += data[i];
+    }
+    return sum;
 }
 
 void send_data(PacketType type, uint16_t payload_length, uint8_t *data) {
     uint8_t packet[MAX_PACKET_SIZE];
-    uint16_t frag_total = (payload_length + MAX_PAYLOAD_SIZE - 1) / MAX_PAYLOAD_SIZE;
+    uint16_t frag_total = (payload_length == 0) ? 1 :
+                          (payload_length + MAX_PAYLOAD_SIZE - 1) / MAX_PAYLOAD_SIZE;
 
-    packet[IDX_TYPE] = (uint8_t)type;
+    for (uint16_t frag_id = 0; frag_id < frag_total; frag_id++) {
+        uint16_t offset     = frag_id * MAX_PAYLOAD_SIZE;
+        uint16_t chunk_size = (payload_length - offset < MAX_PAYLOAD_SIZE) ?
+                              (payload_length - offset) : MAX_PAYLOAD_SIZE;
 
-    packet[IDX_FRAG_TOT_LSB] = (frag_total >> 8) & 0xFF;
-    packet[IDX_FRAG_TOT_MSB] = (frag_total) & 0xFF;
+        packet[IDX_TYPE]         = (uint8_t)type;
+        packet[IDX_SEQ_MSB]      = (sequence_id >> 8) & 0xFF;
+        packet[IDX_SEQ_LSB]      = sequence_id & 0xFF;
+        packet[IDX_FRAG_ID_MSB]  = (frag_id >> 8) & 0xFF;
+        packet[IDX_FRAG_ID_LSB]  = frag_id & 0xFF;
+        packet[IDX_FRAG_TOT_MSB] = (frag_total >> 8) & 0xFF;
+        packet[IDX_FRAG_TOT_LSB] = frag_total & 0xFF;
+        packet[IDX_LEN_MSB]      = (chunk_size >> 8) & 0xFF;
+        packet[IDX_LEN_LSB]      = chunk_size & 0xFF;
+        packet[IDX_CRC_MSB]      = 0x00;
+        packet[IDX_CRC_LSB]      = 0x00;
 
-    uint32_t offset = 0;
-
-    for (uint16_t frag_id = 0; frag_id <= frag_total; frag_id++) {
-        uint16_t current_chunk_size = MAX_PAYLOAD_SIZE;
-
-        if ((payload_length - offset) < MAX_PAYLOAD_SIZE) {
-            current_chunk_size = (uint16_t)(payload_length - offset);
+        if (chunk_size > 0 && data != NULL) {
+            memcpy(&packet[IDX_DATA_START], &data[offset], chunk_size);
         }
 
-        packet[IDX_SEQ_LSB] = (sequence_id >> 8) & 0xFF;
-        packet[IDX_SEQ_MSB] = sequence_id & 0xFF;
+        uint16_t total_len = HEADER_SIZE + chunk_size;
+        uint16_t crc = calculate_checksum(packet, total_len);
+        packet[IDX_CRC_MSB] = (crc >> 8) & 0xFF;
+        packet[IDX_CRC_LSB] = crc & 0xFF;
 
-        packet[IDX_FRAG_ID_LSB] = (frag_id >> 8) & 0xFF;
-        packet[IDX_FRAG_ID_MSB] = (frag_id) & 0xFF;
-
-        packet[IDX_LEN_MSB] = (current_chunk_size >> 8) & 0xFF;
-        packet[IDX_LEN_LSB] = (current_chunk_size) & 0xFF;
-
-        if (current_chunk_size > 0 && data != NULL) {
-            memcpy(&packet[HEADER_SIZE], &data[offset], current_chunk_size);
-        }
-
-        packet[IDX_CRC_MSB] = 0x00;
-        packet[IDX_CRC_LSB] = 0x00;
-
-        uint16_t total_packet_len = HEADER_SIZE + current_chunk_size;
-        uint16_t my_crc = calculate_crc16(packet, total_packet_len);
-
-        packet[IDX_CRC_MSB] = (my_crc >> 8) & 0xFF;
-        packet[IDX_CRC_LSB] = (my_crc) & 0xFF;
-
-        if (tcp_send_bytes(packet, total_packet_len) < 0) {
-            fprintf(stderr, "[TCP] Failed to send packet fragment %u\n", frag_id);
+        if (tcp_send_bytes(packet, total_len) < 0) {
+            fprintf(stderr, "[TCP] Failed to send fragment %u/%u\n", frag_id + 1, frag_total);
             return;
         }
-
-        offset += current_chunk_size;
-        sequence_id++;
     }
+
+    sequence_id++;
 }
 
+int receive_packet(RawPacket *pkt) {
+    uint8_t header[HEADER_SIZE];
+
+    if (tcp_recv_bytes(header, HEADER_SIZE) <= 0) {
+        return -1;
+    }
+
+    pkt->type           = (PacketType)header[IDX_TYPE];
+    pkt->seq_id         = ((uint16_t)header[IDX_SEQ_MSB]      << 8) | header[IDX_SEQ_LSB];
+    pkt->frag_id        = ((uint16_t)header[IDX_FRAG_ID_MSB]  << 8) | header[IDX_FRAG_ID_LSB];
+    pkt->frag_total     = ((uint16_t)header[IDX_FRAG_TOT_MSB] << 8) | header[IDX_FRAG_TOT_LSB];
+    pkt->payload_length = ((uint16_t)header[IDX_LEN_MSB]      << 8) | header[IDX_LEN_LSB];
+
+    uint16_t received_crc = ((uint16_t)header[IDX_CRC_MSB] << 8) | header[IDX_CRC_LSB];
+
+    if (pkt->payload_length > MAX_PAYLOAD_SIZE) {
+        fprintf(stderr, "[TCP] Invalid payload length: %u\n", pkt->payload_length);
+        return -1;
+    }
+
+    if (pkt->payload_length > 0) {
+        if (tcp_recv_bytes(pkt->data, pkt->payload_length) <= 0) {
+            return -1;
+        }
+    }
+
+    /* Verify checksum over the full raw packet with CRC bytes zeroed */
+    uint8_t raw[MAX_PACKET_SIZE];
+    memcpy(raw, header, HEADER_SIZE);
+    memcpy(&raw[IDX_DATA_START], pkt->data, pkt->payload_length);
+    raw[IDX_CRC_MSB] = 0x00;
+    raw[IDX_CRC_LSB] = 0x00;
+
+    uint16_t computed_crc = calculate_checksum(raw, HEADER_SIZE + pkt->payload_length);
+    if (computed_crc != received_crc) {
+        fprintf(stderr, "[TCP] Checksum mismatch: expected 0x%04X, got 0x%04X\n",
+                computed_crc, received_crc);
+        return -1;
+    }
+
+    return 0;
+}
