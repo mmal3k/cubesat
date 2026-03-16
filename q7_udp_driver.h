@@ -3,9 +3,9 @@
 
 #include <stdint.h>
 
-#define HEADER_SIZE      11
-#define MAX_PACKET_SIZE  256
-#define MAX_PAYLOAD_SIZE (MAX_PACKET_SIZE - HEADER_SIZE)  /* 245 bytes */
+#define HEADER_SIZE 11
+#define MAX_PACKET_SIZE 256
+#define MAX_PAYLOAD_SIZE (MAX_PACKET_SIZE - HEADER_SIZE) /* 245 bytes */
 
 #define ACK_TIMEOUT_MS   5000   /* ms to wait for an ACK before retrying  */
 #define MAX_RETRIES      3      /* max retransmissions before giving up    */
@@ -17,29 +17,35 @@
 #define IDX_FRAG_ID_LSB  4
 #define IDX_FRAG_TOT_MSB 5
 #define IDX_FRAG_TOT_LSB 6
-#define IDX_LEN_MSB      7
-#define IDX_LEN_LSB      8
-#define IDX_CRC_MSB      9
-#define IDX_CRC_LSB      10
-#define IDX_DATA_START   11
+#define IDX_LEN_MSB 7
+#define IDX_LEN_LSB 8
+#define IDX_CRC_MSB 9
+#define IDX_CRC_LSB 10
+#define IDX_DATA_START 11
 
-typedef enum {
-    PID_CMD_CONTROL  = 0x10,
-    PID_PING         = 0x11,
+typedef enum
+{
+    PID_CMD_CONTROL = 0x10,
+    PID_PING = 0x11,
     PID_TELEMETRY_HK = 0x50,
-    PID_SCI_IMG      = 0x60,
-    PID_SCI_TXT      = 0x61,
-    PID_ACK          = 0xAA,
-    PID_ERROR        = 0xEE
+    PID_SCI_IMG = 0x60,
+    PID_SCI_TXT = 0x61,
+    PID_ACK = 0xAA,
+    PID_ERROR = 0xEE, /* FIX 1: missing comma was here */
+    /* FIX 2: values aligned with ground_station.py */
+    PID_LIST_FILES = 0x20,
+    PID_LATEST_IMG = 0x21,
+    PID_GET_FILE = 0x22
 } PacketType;
 
-typedef struct {
+typedef struct
+{
     PacketType type;
-    uint16_t   seq_id;
-    uint16_t   frag_id;
-    uint16_t   frag_total;
-    uint16_t   payload_length;
-    uint8_t    data[MAX_PAYLOAD_SIZE];
+    uint16_t seq_id;
+    uint16_t frag_id;
+    uint16_t frag_total;
+    uint16_t payload_length;
+    uint8_t data[MAX_PAYLOAD_SIZE];
 } RawPacket;
 
 /*
@@ -55,6 +61,6 @@ int  udp_init(uint16_t local_port, uint16_t gs_port);
 void udp_close(void);
 int  udp_get_fd(void);
 void send_data(PacketType type, uint32_t payload_length, uint8_t *data);
-int  receive_packet(RawPacket *pkt);
+int receive_packet(RawPacket *pkt);
 
 #endif

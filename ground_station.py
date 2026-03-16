@@ -49,7 +49,12 @@ PID_SCI_IMG      = 0x60
 PID_SCI_TXT      = 0x61
 PID_ACK          = 0xAA
 PID_ERROR        = 0xEE
+# FIX 5: added missing constants used in cmd_menu
+PID_LIST_FILES   = 0x20
+PID_LATEST_IMG   = 0x21
+PID_GET_FILE     = 0x22
 
+# FIX 6: added missing entries so received packets log correctly
 PACKET_TYPE_NAMES = {
     PID_CMD_CONTROL:  "CMD_CONTROL",
     PID_PING:         "PING",
@@ -58,6 +63,9 @@ PACKET_TYPE_NAMES = {
     PID_SCI_TXT:      "SCI_TXT",
     PID_ACK:          "ACK",
     PID_ERROR:        "ERROR",
+    PID_LIST_FILES:   "LIST_FILES",
+    PID_LATEST_IMG:   "LATEST_IMG",
+    PID_GET_FILE:     "GET_FILE",
 }
 
 # ── Sequence counter ────────────────────────────────────────────
@@ -290,6 +298,35 @@ def send_packet(sock, pkt_type: int, payload: bytes = b''):
     print(f"[TX] [{name}]  {len(payload)} bytes  → {addr[0]}:{addr[1]}")
 
 
+def cmd_menu(conn):
+    while True:
+        print()
+        print("CMD MENU:")
+        print("1 - Show list of files on Q7")
+        print("2 - Request latest image")
+        print("3 - Request file by path")
+        print("back - return to main menu")
+        print()
+
+        choice = input("cmd> ").strip()
+
+        if choice == "1":
+            send_packet(conn, PID_LIST_FILES)
+
+        elif choice == "2":
+            send_packet(conn, PID_LATEST_IMG)
+
+        elif choice == "3":
+            path = input("Enter file path: ").strip()
+            send_packet(conn, PID_GET_FILE, path.encode())
+
+        elif choice == "back":
+            break
+
+        else:
+            print("Invalid choice.")
+
+
 # ── Main ─────────────────────────────────────────────────────────
 def main():
     gs_port = 5000   # GS listens here  (Q7 broadcasts beacons to this port)
@@ -307,7 +344,12 @@ def main():
     print("╚══════════════════════════════════════════╝")
     print(f"Listening for beacons on port {gs_port}")
     print(f"Commands will go to Q7 port  {q7_port}")
-    print()
+    # print("Commands:")
+    # print("  ping            - send a PING to the Q7")
+    # print("  ack             - send an ACK")
+    # print("  cmd             - open command menu")
+    # print("  quit            - disconnect")
+    # print()
     print("Commands:  ping | cmd <text> | quit")
     print("Waiting for Q7 beacon...")
     print()
@@ -327,12 +369,12 @@ def main():
             send_packet(sock, PID_PING)
         elif line == 'ack':
             send_packet(sock, PID_ACK)
-        elif line.startswith('cmd '):
-            send_packet(sock, PID_CMD_CONTROL, line[4:].encode())
+        elif line == "cmd":
+            cmd_menu(sock)
         elif line == 'quit':
             break
         else:
-            print("Unknown command.  Try:  ping | cmd <text> | quit")
+            print("Unknown command. Try: ping | ack | cmd | quit")
 
     sock.close()
     print("[GS] Closed.")
