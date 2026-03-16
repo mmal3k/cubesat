@@ -8,7 +8,7 @@
 
 #include "q7_udp_driver.h"
 
-#define BEACON_INTERVAL_S  10   /* send PING + TELEMETRY_HK every N seconds */
+#define BEACON_INTERVAL_S 10 /* send PING + TELEMETRY_HK every N seconds */
 
 static int send_image(const char *path)
 {
@@ -53,29 +53,57 @@ static int send_image(const char *path)
     return 0;
 }
 
-/* FIX 4 (cont): moved here from q7_tcp_driver.c so send_image() is visible */
 static void send_file_list(const char *dir_path)
 {
     DIR *dir = opendir(dir_path);
     if (!dir)
     {
-        fprintf(stderr, "[FILES] Cannot open directory\n");
+        fprintf(stderr, "[FILES] Cannot open directory: %s\n", dir_path);
         return;
     }
 
-    char buffer[4096] = {0};
-    struct dirent *entry;
-
-    while ((entry = readdir(dir)) != NULL)
+    /* Dynamically grown buffer — doubles when full, no fixed-size overflow */
+    size_t cap = 4096;
+    size_t used = 0;
+    char *buf = (char *)malloc(cap);
+    if (!buf)
     {
-        strcat(buffer, entry->d_name);
-        strcat(buffer, "\n");
+        fprintf(stderr, "[FILES] malloc failed\n");
+        closedir(dir);
+        return;
     }
 
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL)
+    {
+        size_t name_len = strlen(entry->d_name);
+        size_t needed = used + name_len + 2; /* '\n' + '\0' */
+
+        if (needed > cap)
+        {
+            size_t new_cap = cap * 2;
+            while (new_cap < needed)
+                new_cap *= 2;
+            char *tmp = (char *)realloc(buf, new_cap);
+            if (!tmp)
+            {
+                fprintf(stderr, "[FILES] realloc failed - list truncated\n");
+                break;
+            }
+            buf = tmp;
+            cap = new_cap;
+        }
+
+        memcpy(buf + used, entry->d_name, name_len);
+        used += name_len;
+        buf[used++] = '\n';
+    }
+    buf[used] = '\0';
     closedir(dir);
 
-    printf("[TX] Sending file list\n");
-    send_data(PID_SCI_TXT, strlen(buffer), (uint8_t *)buffer);
+    printf("[TX] Sending file list (%zu bytes)\n", used);
+    send_data(PID_SCI_TXT, (uint32_t)used, (uint8_t *)buf);
+    free(buf);
 }
 
 static int send_file(const char *path)
@@ -118,23 +146,29 @@ static const char *packet_type_name(PacketType type)
         return "unknown";
     }
 }
-static void send_beacon(void) {
+static void send_beacon(void)
+{
     uint8_t payload[] = "HELLO FROM Q7";
     printf("[TX] Beacon: PING + TELEMETRY_HK\n");
     send_data(PID_PING, 0, NULL);
     send_data(PID_TELEMETRY_HK, (uint32_t)(sizeof(payload) - 1), payload);
 }
 
-int main(int argc, char *argv[]) {
-    uint16_t    local_port = 5001;   /* Q7 listens here for commands    */
-    uint16_t    gs_port    = 5000;   /* GS listens here for beacons     */
-    const char *img_path   = NULL;
+int main(int argc, char *argv[])
+{
+    uint16_t local_port = 5001; /* Q7 listens here for commands    */
+    uint16_t gs_port = 5000;    /* GS listens here for beacons     */
+    const char *img_path = NULL;
 
-    if (argc >= 2) local_port = (uint16_t)atoi(argv[1]);
-    if (argc >= 3) gs_port    = (uint16_t)atoi(argv[2]);
-    if (argc >= 4) img_path   = argv[3];
+    if (argc >= 2)
+        local_port = (uint16_t)atoi(argv[1]);
+    if (argc >= 3)
+        gs_port = (uint16_t)atoi(argv[2]);
+    if (argc >= 4)
+        img_path = argv[3];
 
-    if (udp_init(local_port, gs_port) != 0) {
+    if (udp_init(local_port, gs_port) != 0)
+    {
         fprintf(stderr, "Failed to init UDP (local=%u gs=%u)\n",
                 local_port, gs_port);
         return 1;
@@ -151,20 +185,23 @@ int main(int argc, char *argv[]) {
 
     int fd = udp_get_fd();
 
-    while (1) {
+    while (1)
+    {
         fd_set rfds;
         FD_ZERO(&rfds);
         FD_SET(fd, &rfds);
 
-        struct timeval tv = { .tv_sec = BEACON_INTERVAL_S, .tv_usec = 0 };
+        struct timeval tv = {.tv_sec = BEACON_INTERVAL_S, .tv_usec = 0};
         int ret = select(fd + 1, &rfds, NULL, NULL, &tv);
 
-        if (ret < 0) {
+        if (ret < 0)
+        {
             perror("[q7] select");
             break;
         }
 
-        if (ret == 0) {
+        if (ret == 0)
+        {
             /* timeout — send next beacon */
             send_beacon();
             continue;
@@ -188,10 +225,47 @@ int main(int argc, char *argv[]) {
             printf("     Payload: %.*s\n", (int)pkt.payload_length, pkt.data);
         }
 
-        /* ACK any command we receive */
-        if (pkt.type == PID_CMD_CONTROL) {
+        /* Dispatch incoming commands */
+        if (pkt.type == PID_CMD_CONTROL)
+        {
             printf("[TX] Sending ACK for seq=%u\n", pkt.seq_id);
             send_data(PID_ACK, 0, NULL);
+        }
+        else if (pkt.type == PID_LIST_FILES)
+        {
+            printf("[CMD] Ground station requested file list\n");
+            send_file_list(".");
+        }
+        else if (pkt.type == PID_LATEST_IMG)
+        {
+            printf("[CMD] Ground station requested latest image\n");
+            send_latest_image();
+        }
+        else if (pkt.type == PID_GET_FILE)
+        {
+            if (pkt.payload_length == 0 ||
+                pkt.payload_length >= MAX_PAYLOAD_SIZE)
+            {
+                fprintf(stderr, "[CMD] Invalid filename length: %u\n",
+                        pkt.payload_length);
+            }
+            else
+            {
+                char path[MAX_PAYLOAD_SIZE + 1];
+                memcpy(path, pkt.data, pkt.payload_length);
+                path[pkt.payload_length] = '\0';
+
+                /* Reject path traversal attempts */
+                if (strstr(path, "..") != NULL)
+                {
+                    fprintf(stderr, "[CMD] Path traversal rejected: %s\n", path);
+                }
+                else
+                {
+                    printf("[CMD] Ground station requested file: %s\n", path);
+                    send_file(path);
+                }
+            }
         }
     }
 
