@@ -1,11 +1,14 @@
-#ifndef Q7_TCP_DRIVER_H
-#define Q7_TCP_DRIVER_H
+#ifndef Q7_UDP_DRIVER_H
+#define Q7_UDP_DRIVER_H
 
 #include <stdint.h>
 
 #define HEADER_SIZE      11
 #define MAX_PACKET_SIZE  256
 #define MAX_PAYLOAD_SIZE (MAX_PACKET_SIZE - HEADER_SIZE)  /* 245 bytes */
+
+#define ACK_TIMEOUT_MS   5000   /* ms to wait for an ACK before retrying  */
+#define MAX_RETRIES      3      /* max retransmissions before giving up    */
 
 #define IDX_TYPE         0
 #define IDX_SEQ_MSB      1
@@ -39,8 +42,18 @@ typedef struct {
     uint8_t    data[MAX_PAYLOAD_SIZE];
 } RawPacket;
 
-int  tcp_init_connection(const char *ip, uint16_t port);
-void tcp_close_connection(void);
+/*
+ * Initialise the UDP socket.
+ *
+ * local_port : port the Q7 binds to (to receive commands from the GS)
+ * gs_port    : port the GS listens on (beacons are broadcast to this port)
+ *
+ * Beacons are sent to 255.255.255.255:gs_port until the GS address is
+ * learned from the first incoming packet, after which replies go unicast.
+ */
+int  udp_init(uint16_t local_port, uint16_t gs_port);
+void udp_close(void);
+int  udp_get_fd(void);
 void send_data(PacketType type, uint32_t payload_length, uint8_t *data);
 int  receive_packet(RawPacket *pkt);
 

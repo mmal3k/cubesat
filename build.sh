@@ -31,7 +31,7 @@ make
 if [ $? -eq 0 ]; then
     echo "----------------------------------------"
     echo "[SUCCESS] Build complete."
-    echo "Executable created: sensor_test_app"
+    echo "Executable created: q7_test"
     echo "----------------------------------------"
 else
     echo "[FAILURE] Build failed."

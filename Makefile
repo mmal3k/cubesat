@@ -1,11 +1,11 @@
-# Makefile for INA260 Sensor Test
+# Makefile for Q7 UDP Communication
 # The Q7 SDK environment automatically defines the variables: CC, CFLAGS, LDFLAGS
 
 # 1. Name of the output file (the executable)
-TARGET = sensor_test_app
+TARGET = q7_test
 
 # 2. List of source files
-SRCS = ina260_tests.c monitor_driver.c
+SRCS = q7_test.c q7_udp_driver.c
 
 # 3. Create object files (.o) from source files (.c)
 OBJS = $(SRCS:.c=.o)

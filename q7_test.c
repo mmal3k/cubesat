@@ -3,8 +3,11 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <sys/select.h>
 
-#include "q7_tcp_driver.h"
+#include "q7_udp_driver.h"
+
+#define BEACON_INTERVAL_S  10   /* send PING + TELEMETRY_HK every N seconds */
 
 static int send_image(const char *path) {
     FILE *f = fopen(path, "rb");
@@ -57,37 +60,60 @@ static const char *packet_type_name(PacketType type) {
     }
 }
 
+static void send_beacon(void) {
+    uint8_t payload[] = "HELLO FROM Q7";
+    printf("[TX] Beacon: PING + TELEMETRY_HK\n");
+    send_data(PID_PING, 0, NULL);
+    send_data(PID_TELEMETRY_HK, (uint32_t)(sizeof(payload) - 1), payload);
+}
+
 int main(int argc, char *argv[]) {
-    const char *ip       = "127.0.0.1";
-    uint16_t    port     = 5000;
-    const char *img_path = NULL;
+    uint16_t    local_port = 5001;   /* Q7 listens here for commands    */
+    uint16_t    gs_port    = 5000;   /* GS listens here for beacons     */
+    const char *img_path   = NULL;
 
-    if (argc >= 2) ip       = argv[1];
-    if (argc >= 3) port     = (uint16_t)atoi(argv[2]);
-    if (argc >= 4) img_path = argv[3];
+    if (argc >= 2) local_port = (uint16_t)atoi(argv[1]);
+    if (argc >= 3) gs_port    = (uint16_t)atoi(argv[2]);
+    if (argc >= 4) img_path   = argv[3];
 
-    if (tcp_init_connection(ip, port) != 0) {
-        fprintf(stderr, "Failed to connect to %s:%u\n", ip, (unsigned)port);
+    if (udp_init(local_port, gs_port) != 0) {
+        fprintf(stderr, "Failed to init UDP (local=%u gs=%u)\n",
+                local_port, gs_port);
         return 1;
     }
 
-    /* Send a ping */
-    printf("[TX] Sending PING\n");
-    send_data(PID_PING, 0, NULL);
-
-    /* Send a telemetry packet */
-    uint8_t payload[] = "HELLO FROM Q7";
-    printf("[TX] Sending TELEMETRY_HK: \"%s\"\n", payload);
-    send_data(PID_TELEMETRY_HK, (uint16_t)(sizeof(payload) - 1), payload);
+    /* Initial beacon */
+    send_beacon();
 
     /* Send image if path provided */
     if (img_path) {
         send_image(img_path);
     }
 
-    /* Wait for packets from ground station */
-    printf("[RX] Waiting for packets from ground station...\n");
+    printf("[Q7] Beacon interval: %d s  |  Ctrl-C to stop\n", BEACON_INTERVAL_S);
+
+    int fd = udp_get_fd();
+
     while (1) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(fd, &rfds);
+
+        struct timeval tv = { .tv_sec = BEACON_INTERVAL_S, .tv_usec = 0 };
+        int ret = select(fd + 1, &rfds, NULL, NULL, &tv);
+
+        if (ret < 0) {
+            perror("[Q7] select");
+            break;
+        }
+
+        if (ret == 0) {
+            /* Timeout — send next beacon */
+            send_beacon();
+            continue;
+        }
+
+        /* Packet available — receive and handle */
         RawPacket pkt;
         if (receive_packet(&pkt) < 0) {
             fprintf(stderr, "[RX] Failed to receive packet, exiting.\n");
@@ -105,11 +131,11 @@ int main(int argc, char *argv[]) {
 
         /* ACK any command we receive */
         if (pkt.type == PID_CMD_CONTROL) {
-            printf("[TX] Sending ACK\n");
+            printf("[TX] Sending ACK for seq=%u\n", pkt.seq_id);
             send_data(PID_ACK, 0, NULL);
         }
     }
 
-    tcp_close_connection();
+    udp_close();
     return 0;
 }
