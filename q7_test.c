@@ -4,11 +4,16 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <sys/select.h>
+#include <sys/stat.h>
 #include <dirent.h>
 
 #include "q7_udp_driver.h"
 
 #define BEACON_INTERVAL_S 10 /* send PING + TELEMETRY_HK every N seconds */
+
+/* ------------------------------------------------------------------ */
+/*  File helpers                                                        */
+/* ------------------------------------------------------------------ */
 
 static int send_image(const char *path)
 {
@@ -53,16 +58,48 @@ static int send_image(const char *path)
     return 0;
 }
 
+/* Returns 1 if str ends with suffix, 0 otherwise */
+static int ends_with(const char *str, const char *suffix)
+{
+    if (!str || !suffix)
+        return 0;
+    size_t len = strlen(str);
+    size_t suffix_len = strlen(suffix);
+    if (len < suffix_len)
+        return 0;
+    return strcmp(str + len - suffix_len, suffix) == 0;
+}
+
+/* Returns 1 if filename has a recognised image extension */
+static int is_image_file(const char *filename)
+{
+    return ends_with(filename, ".jpg") ||
+           ends_with(filename, ".jpeg") ||
+           ends_with(filename, ".png") ||
+           ends_with(filename, ".bin");
+}
+
+/*
+ * send_file_list – enumerate dir_path, list image files, transmit as PID_SCI_TXT.
+ *
+ * Always sends a response so the ground station never waits in silence:
+ *   - opendir failure  → sends an error string
+ *   - no images found  → sends "(no image files found)"
+ *   - success          → sends newline-separated filenames
+ */
 static void send_file_list(const char *dir_path)
 {
     DIR *dir = opendir(dir_path);
     if (!dir)
     {
         fprintf(stderr, "[FILES] Cannot open directory: %s\n", dir_path);
+        /* FIX 1: send error response so GS always gets something */
+        const char *err = "(error: could not open directory)";
+        send_data(PID_SCI_TXT, (uint32_t)strlen(err), (uint8_t *)err);
         return;
     }
 
-    /* Dynamically grown buffer — doubles when full, no fixed-size overflow */
+    /* Dynamically grown buffer — doubles when full */
     size_t cap = 4096;
     size_t used = 0;
     char *buf = (char *)malloc(cap);
@@ -70,12 +107,17 @@ static void send_file_list(const char *dir_path)
     {
         fprintf(stderr, "[FILES] malloc failed\n");
         closedir(dir);
+        const char *err = "(error: out of memory)";
+        send_data(PID_SCI_TXT, (uint32_t)strlen(err), (uint8_t *)err);
         return;
     }
 
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL)
     {
+        if (!is_image_file(entry->d_name))
+            continue;
+
         size_t name_len = strlen(entry->d_name);
         size_t needed = used + name_len + 2; /* '\n' + '\0' */
 
@@ -101,22 +143,88 @@ static void send_file_list(const char *dir_path)
     buf[used] = '\0';
     closedir(dir);
 
-    printf("[TX] Sending file list (%zu bytes)\n", used);
+    /* FIX 2: send placeholder when directory has no matching files
+     * so the GS never receives a 0-byte payload (which it silently drops) */
+    if (used == 0)
+    {
+        free(buf);
+        const char *empty = "(no image files found)";
+        printf("[TX] Sending file list (none found in %s)\n", dir_path);
+        send_data(PID_SCI_TXT, (uint32_t)strlen(empty), (uint8_t *)empty);
+        return;
+    }
+
+    printf("[TX] Sending file list (%zu bytes, dir=%s)\n", used, dir_path);
     send_data(PID_SCI_TXT, (uint32_t)used, (uint8_t *)buf);
     free(buf);
 }
 
-static int send_file(const char *path)
+/*
+ * send_latest_image – find the most recently modified image in dir_path
+ * and transmit it.
+ *
+ * FIX 3: stat() is now called with the full path (dir_path + "/" + name)
+ *        so it works regardless of the process's working directory.
+ * FIX 1: sends an error response if nothing is found so GS never waits
+ *        in silence.
+ */
+static void send_latest_image(const char *dir_path)
 {
-    return send_image(path);
+    DIR *dir = opendir(dir_path);
+    if (!dir)
+    {
+        fprintf(stderr, "[CMD] Cannot open directory: %s\n", dir_path);
+        const char *err = "(error: could not open directory)";
+        send_data(PID_SCI_TXT, (uint32_t)strlen(err), (uint8_t *)err);
+        return;
+    }
+
+    struct dirent *entry;
+    struct stat file_stat;
+    char newest_file[256] = {0};
+    time_t newest_time = 0;
+    int found = 0; /* FIX: explicit flag, not newest_time==0 */
+
+    while ((entry = readdir(dir)) != NULL)
+    {
+        if (!is_image_file(entry->d_name))
+            continue;
+
+        /* FIX 3: build full path so stat() works from any cwd */
+        char full_path[512];
+        snprintf(full_path, sizeof(full_path), "%s/%s",
+                 dir_path, entry->d_name);
+
+        if (stat(full_path, &file_stat) == 0)
+        {
+            if (!found || file_stat.st_mtime > newest_time)
+            {
+                newest_time = file_stat.st_mtime;
+                strncpy(newest_file, entry->d_name, sizeof(newest_file) - 1);
+                found = 1;
+            }
+        }
+    }
+    closedir(dir);
+
+    if (!found)
+    {
+        printf("[TX] No image files found in %s\n", dir_path);
+        const char *err = "(no image files found)";
+        send_data(PID_SCI_TXT, (uint32_t)strlen(err), (uint8_t *)err);
+        return;
+    }
+
+    /* Build the full path for send_image() as well */
+    char send_path[512];
+    snprintf(send_path, sizeof(send_path), "%s/%s", dir_path, newest_file);
+    printf("[TX] Found latest image: %s\n", newest_file);
+    send_image(send_path);
 }
 
-static void send_latest_image(void)
-{
-    const char *latest_img = "latest_image.bin";
-    printf("[TX] Sending latest image\n");
-    send_image(latest_img);
-}
+/* ------------------------------------------------------------------ */
+/*  Logging helper                                                      */
+/* ------------------------------------------------------------------ */
 
 static const char *packet_type_name(PacketType type)
 {
@@ -146,6 +254,11 @@ static const char *packet_type_name(PacketType type)
         return "unknown";
     }
 }
+
+/* ------------------------------------------------------------------ */
+/*  Beacon                                                              */
+/* ------------------------------------------------------------------ */
+
 static void send_beacon(void)
 {
     uint8_t payload[] = "HELLO FROM Q7";
@@ -154,10 +267,14 @@ static void send_beacon(void)
     send_data(PID_TELEMETRY_HK, (uint32_t)(sizeof(payload) - 1), payload);
 }
 
+/* ------------------------------------------------------------------ */
+/*  Main                                                                */
+/* ------------------------------------------------------------------ */
+
 int main(int argc, char *argv[])
 {
-    uint16_t local_port = 5001; /* Q7 listens here for commands    */
-    uint16_t gs_port = 5000;    /* GS listens here for beacons     */
+    uint16_t local_port = 5001;
+    uint16_t gs_port = 5000;
     const char *img_path = NULL;
 
     if (argc >= 2)
@@ -174,12 +291,9 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    /* Initial beacon */
     send_beacon();
     if (img_path)
-    {
         send_image(img_path);
-    }
 
     printf("[q7] beacon interval: %d s  |  ctrl-c to stop\n", BEACON_INTERVAL_S);
 
@@ -202,12 +316,10 @@ int main(int argc, char *argv[])
 
         if (ret == 0)
         {
-            /* timeout — send next beacon */
             send_beacon();
             continue;
         }
 
-        /* packet available — receive and handle */
         RawPacket pkt;
         if (receive_packet(&pkt) < 0)
         {
@@ -220,10 +332,8 @@ int main(int argc, char *argv[])
                pkt.seq_id, pkt.frag_id + 1, pkt.frag_total,
                pkt.payload_length);
 
-        if (pkt.payload_length > 0)
-        {
+        if (pkt.payload_length > 0 && pkt.type != PID_SCI_IMG)
             printf("     Payload: %.*s\n", (int)pkt.payload_length, pkt.data);
-        }
 
         /* Dispatch incoming commands */
         if (pkt.type == PID_CMD_CONTROL)
@@ -239,7 +349,7 @@ int main(int argc, char *argv[])
         else if (pkt.type == PID_LATEST_IMG)
         {
             printf("[CMD] Ground station requested latest image\n");
-            send_latest_image();
+            send_latest_image(".");
         }
         else if (pkt.type == PID_GET_FILE)
         {
@@ -255,15 +365,12 @@ int main(int argc, char *argv[])
                 memcpy(path, pkt.data, pkt.payload_length);
                 path[pkt.payload_length] = '\0';
 
-                /* Reject path traversal attempts */
                 if (strstr(path, "..") != NULL)
-                {
                     fprintf(stderr, "[CMD] Path traversal rejected: %s\n", path);
-                }
                 else
                 {
                     printf("[CMD] Ground station requested file: %s\n", path);
-                    send_file(path);
+                    send_image(path); /* removed pointless send_file wrapper */
                 }
             }
         }
