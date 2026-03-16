@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <errno.h>
 #include <string.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <stdint.h>
 #include <time.h>
@@ -13,9 +14,19 @@
 #include "q7_udp_driver.h"
 
 static int               udp_sock    = -1;
-static struct sockaddr_in gs_addr;           /* destination: broadcast until GS is known */
+static struct sockaddr_in gs_addr;
 static int               gs_addr_known = 0;
 static uint16_t          sequence_id   = 0;
+
+/* NACK data filled by wait_for_response() */
+#define MAX_NACK_FRAGS   ((MAX_PAYLOAD_SIZE - 2) / 2)   /* 121 */
+static uint16_t nack_frags[MAX_NACK_FRAGS];
+static uint16_t nack_count = 0;
+
+/* Return codes for wait_for_response() */
+#define WAIT_ACK     0
+#define WAIT_NACK    1
+#define WAIT_TIMEOUT (-1)
 
 int udp_init(uint16_t local_port, uint16_t gs_port) {
     if (udp_sock != -1)
@@ -27,7 +38,6 @@ int udp_init(uint16_t local_port, uint16_t gs_port) {
         return -1;
     }
 
-    /* Enable broadcast so we can send beacons without knowing the GS address */
     int broadcast = 1;
     if (setsockopt(udp_sock, SOL_SOCKET, SO_BROADCAST,
                    &broadcast, sizeof(broadcast)) < 0) {
@@ -37,7 +47,6 @@ int udp_init(uint16_t local_port, uint16_t gs_port) {
         return -1;
     }
 
-    /* Bind to local_port so the GS can send commands back to us */
     struct sockaddr_in local = {0};
     local.sin_family      = AF_INET;
     local.sin_addr.s_addr = INADDR_ANY;
@@ -50,7 +59,6 @@ int udp_init(uint16_t local_port, uint16_t gs_port) {
         return -1;
     }
 
-    /* Point gs_addr at the broadcast address until we hear from the GS */
     memset(&gs_addr, 0, sizeof(gs_addr));
     gs_addr.sin_family      = AF_INET;
     gs_addr.sin_addr.s_addr = INADDR_BROADCAST;
@@ -62,15 +70,17 @@ int udp_init(uint16_t local_port, uint16_t gs_port) {
     return 0;
 }
 
-int udp_get_fd(void) { return udp_sock; }
-
 void udp_close(void) {
     if (udp_sock != -1) {
         close(udp_sock);
-        udp_sock    = -1;
+        udp_sock      = -1;
         gs_addr_known = 0;
     }
 }
+
+int udp_get_fd(void) { return udp_sock; }
+
+/* ── Checksums ──────────────────────────────────────────────────── */
 
 static uint16_t calculate_checksum(const uint8_t *data, int len) {
     uint16_t sum = 0;
@@ -79,54 +89,98 @@ static uint16_t calculate_checksum(const uint8_t *data, int len) {
     return sum;
 }
 
-/* Send all fragments for a given sequence ID (no ACK logic here) */
-static int send_fragments(PacketType type, uint32_t payload_length,
-                           uint8_t *data, uint16_t seq) {
+static uint32_t crc32_compute(const uint8_t *data, uint32_t len) {
+    uint32_t crc = 0xFFFFFFFF;
+    for (uint32_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int j = 0; j < 8; j++)
+            crc = (crc & 1) ? (crc >> 1) ^ 0xEDB88320 : (crc >> 1);
+    }
+    return crc ^ 0xFFFFFFFF;
+}
+
+/* ── Fragment helpers ───────────────────────────────────────────── */
+
+/* Compute total number of fragments for a given payload length */
+static uint16_t frag_total_for(uint32_t len) {
+    return (len == 0) ? 1 : (uint16_t)((len + MAX_PAYLOAD_SIZE - 1) / MAX_PAYLOAD_SIZE);
+}
+
+/* Build and send a single fragment */
+static int send_one_fragment(PacketType type, uint32_t total_len, uint8_t *data,
+                              uint16_t seq, uint16_t frag_id, uint16_t frag_total) {
     uint8_t  packet[MAX_PACKET_SIZE];
-    uint16_t frag_total = (payload_length == 0) ? 1 :
-                          (uint16_t)((payload_length + MAX_PAYLOAD_SIZE - 1) / MAX_PAYLOAD_SIZE);
+    uint32_t offset     = (uint32_t)frag_id * MAX_PAYLOAD_SIZE;
+    uint16_t chunk_size = (total_len - offset < MAX_PAYLOAD_SIZE)
+                        ? (uint16_t)(total_len - offset) : MAX_PAYLOAD_SIZE;
 
-    for (uint16_t frag_id = 0; frag_id < frag_total; frag_id++) {
-        uint32_t offset     = (uint32_t)frag_id * MAX_PAYLOAD_SIZE;
-        uint16_t chunk_size = (payload_length - offset < MAX_PAYLOAD_SIZE) ?
-                              (uint16_t)(payload_length - offset) : MAX_PAYLOAD_SIZE;
+    packet[IDX_TYPE]         = (uint8_t)type;
+    packet[IDX_SEQ_MSB]      = (seq        >> 8) & 0xFF;
+    packet[IDX_SEQ_LSB]      =  seq               & 0xFF;
+    packet[IDX_FRAG_ID_MSB]  = (frag_id    >> 8) & 0xFF;
+    packet[IDX_FRAG_ID_LSB]  =  frag_id           & 0xFF;
+    packet[IDX_FRAG_TOT_MSB] = (frag_total >> 8) & 0xFF;
+    packet[IDX_FRAG_TOT_LSB] =  frag_total        & 0xFF;
+    packet[IDX_LEN_MSB]      = (chunk_size >> 8) & 0xFF;
+    packet[IDX_LEN_LSB]      =  chunk_size        & 0xFF;
+    packet[IDX_CRC_MSB]      = 0x00;
+    packet[IDX_CRC_LSB]      = 0x00;
 
-        packet[IDX_TYPE]         = (uint8_t)type;
-        packet[IDX_SEQ_MSB]      = (seq      >> 8) & 0xFF;
-        packet[IDX_SEQ_LSB]      =  seq             & 0xFF;
-        packet[IDX_FRAG_ID_MSB]  = (frag_id  >> 8) & 0xFF;
-        packet[IDX_FRAG_ID_LSB]  =  frag_id         & 0xFF;
-        packet[IDX_FRAG_TOT_MSB] = (frag_total >> 8) & 0xFF;
-        packet[IDX_FRAG_TOT_LSB] =  frag_total       & 0xFF;
-        packet[IDX_LEN_MSB]      = (chunk_size >> 8) & 0xFF;
-        packet[IDX_LEN_LSB]      =  chunk_size        & 0xFF;
-        packet[IDX_CRC_MSB]      = 0x00;
-        packet[IDX_CRC_LSB]      = 0x00;
+    if (chunk_size > 0 && data != NULL)
+        memcpy(&packet[IDX_DATA_START], &data[offset], chunk_size);
 
-        if (chunk_size > 0 && data != NULL)
-            memcpy(&packet[IDX_DATA_START], &data[offset], chunk_size);
+    uint16_t total_pkt_len = HEADER_SIZE + chunk_size;
+    uint16_t crc           = calculate_checksum(packet, total_pkt_len);
+    packet[IDX_CRC_MSB] = (crc >> 8) & 0xFF;
+    packet[IDX_CRC_LSB] =  crc        & 0xFF;
 
-        uint16_t total_len = HEADER_SIZE + chunk_size;
-        uint16_t crc       = calculate_checksum(packet, total_len);
-        packet[IDX_CRC_MSB] = (crc >> 8) & 0xFF;
-        packet[IDX_CRC_LSB] =  crc        & 0xFF;
-
-        if (sendto(udp_sock, packet, total_len, 0,
-                   (struct sockaddr *)&gs_addr, sizeof(gs_addr)) < 0) {
-            fprintf(stderr, "[UDP] sendto failed on fragment %u/%u: %s\n",
-                    frag_id + 1, frag_total, strerror(errno));
-            return -1;
-        }
+    if (sendto(udp_sock, packet, total_pkt_len, 0,
+               (struct sockaddr *)&gs_addr, sizeof(gs_addr)) < 0) {
+        fprintf(stderr, "[UDP] sendto failed frag %u/%u: %s\n",
+                frag_id + 1, frag_total, strerror(errno));
+        return -1;
     }
     return 0;
 }
 
+/* Send all fragments (frag 0 .. frag_total-1) */
+static int send_fragments(PacketType type, uint32_t total_len,
+                           uint8_t *data, uint16_t seq) {
+    uint16_t ft = frag_total_for(total_len);
+    for (uint16_t fid = 0; fid < ft; fid++)
+        if (send_one_fragment(type, total_len, data, seq, fid, ft) < 0)
+            return -1;
+    return 0;
+}
+
+/* Send only the missing fragments listed in frag_ids[] */
+static int send_fragments_selective(PacketType type, uint32_t total_len,
+                                     uint8_t *data, uint16_t seq,
+                                     uint16_t frag_total,
+                                     uint16_t *frag_ids, uint16_t n) {
+    for (uint16_t i = 0; i < n; i++)
+        if (send_one_fragment(type, total_len, data, seq, frag_ids[i], frag_total) < 0)
+            return -1;
+    return 0;
+}
+
+/* Send fragments start_frag .. frag_total-1 (for resume) */
+static int send_fragments_from(PacketType type, uint32_t total_len,
+                                uint8_t *data, uint16_t seq, uint16_t start_frag) {
+    uint16_t ft = frag_total_for(total_len);
+    for (uint16_t fid = start_frag; fid < ft; fid++)
+        if (send_one_fragment(type, total_len, data, seq, fid, ft) < 0)
+            return -1;
+    return 0;
+}
+
+/* ── Wait for ACK or NACK ───────────────────────────────────────── */
+
 /*
- * Wait up to ACK_TIMEOUT_MS for a PID_ACK with matching seq_id.
- * Any non-ACK or wrong-seq packets received while waiting are discarded.
- * Returns 0 on success, -1 on timeout.
+ * Block up to ACK_TIMEOUT_MS waiting for a response to expected_seq.
+ * Returns WAIT_ACK, WAIT_NACK (fills nack_frags/nack_count), or WAIT_TIMEOUT.
  */
-static int wait_for_ack(uint16_t expected_seq) {
+static int wait_for_response(uint16_t expected_seq) {
     struct timespec deadline;
     clock_gettime(CLOCK_MONOTONIC, &deadline);
     deadline.tv_sec  += ACK_TIMEOUT_MS / 1000;
@@ -142,7 +196,7 @@ static int wait_for_ack(uint16_t expected_seq) {
 
         long ms_left = (deadline.tv_sec  - now.tv_sec)  * 1000 +
                        (deadline.tv_nsec - now.tv_nsec) / 1000000L;
-        if (ms_left <= 0) return -1;
+        if (ms_left <= 0) return WAIT_TIMEOUT;
 
         fd_set rfds;
         FD_ZERO(&rfds);
@@ -151,48 +205,162 @@ static int wait_for_ack(uint16_t expected_seq) {
                               .tv_usec = (ms_left % 1000) * 1000 };
 
         if (select(udp_sock + 1, &rfds, NULL, NULL, &tv) <= 0)
-            return -1;  /* timeout */
+            return WAIT_TIMEOUT;
 
         RawPacket pkt;
         if (receive_packet(&pkt) < 0) continue;
 
         if (pkt.type == PID_ACK && pkt.seq_id == expected_seq)
-            return 0;  /* correct ACK received */
+            return WAIT_ACK;
 
-        /* Wrong type or seq — discard and keep waiting */
+        if (pkt.type == PID_NACK && pkt.seq_id == expected_seq) {
+            /* Parse missing fragment list from payload:
+             * [n_MSB][n_LSB][frag0_MSB][frag0_LSB]... */
+            if (pkt.payload_length < 2) continue;
+            nack_count = ((uint16_t)pkt.data[0] << 8) | pkt.data[1];
+            if (nack_count > MAX_NACK_FRAGS) nack_count = MAX_NACK_FRAGS;
+            for (uint16_t i = 0; i < nack_count; i++)
+                nack_frags[i] = ((uint16_t)pkt.data[2 + i*2] << 8)
+                               | pkt.data[3 + i*2];
+            return WAIT_NACK;
+        }
+
+        /* Any other packet — discard and keep waiting */
     }
 }
 
+/* ── Public API ─────────────────────────────────────────────────── */
+
 void send_data(PacketType type, uint32_t payload_length, uint8_t *data) {
-    /* PID_PING is a beacon (fire and forget). PID_ACK/ERROR never need an ACK. */
     int needs_ack = (type != PID_PING && type != PID_ACK && type != PID_ERROR);
 
-    for (int attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-        if (attempt > 0)
-            printf("[UDP] No ACK for seq=%u — retransmitting (attempt %d/%d)\n",
-                   sequence_id, attempt, MAX_RETRIES);
+    /* Append CRC32 of the full payload for end-to-end integrity */
+    uint8_t  *send_buf = data;
+    uint32_t  send_len = payload_length;
+    uint8_t  *crc_buf  = NULL;
 
-        if (send_fragments(type, payload_length, data, sequence_id) < 0)
-            break;
+    if (payload_length > 0 && data != NULL) {
+        crc_buf = malloc(payload_length + 4);
+        if (crc_buf) {
+            uint32_t crc = crc32_compute(data, payload_length);
+            memcpy(crc_buf, data, payload_length);
+            crc_buf[payload_length]     = (crc >> 24) & 0xFF;
+            crc_buf[payload_length + 1] = (crc >> 16) & 0xFF;
+            crc_buf[payload_length + 2] = (crc >>  8) & 0xFF;
+            crc_buf[payload_length + 3] =  crc        & 0xFF;
+            send_buf = crc_buf;
+            send_len = payload_length + 4;
+        }
+    }
 
-        if (!needs_ack)
-            break;
+    uint16_t ft = frag_total_for(send_len);
 
-        if (wait_for_ack(sequence_id) == 0) {
+    /* Send all fragments for the first attempt */
+    if (send_fragments(type, send_len, send_buf, sequence_id) < 0)
+        goto done;
+
+    if (!needs_ack)
+        goto done;
+
+    int timeouts = 0;
+    while (1) {
+        int result = wait_for_response(sequence_id);
+
+        if (result == WAIT_ACK) {
             printf("[UDP] ACK received for seq=%u\n", sequence_id);
             break;
         }
 
-        if (attempt == MAX_RETRIES)
-            fprintf(stderr, "[UDP] Gave up on seq=%u after %d attempts\n",
+        if (result == WAIT_NACK) {
+            /* GS told us exactly which fragments are missing — retransmit only those */
+            printf("[UDP] NACK seq=%u — resending %u missing frags\n",
+                   sequence_id, nack_count);
+            send_fragments_selective(type, send_len, send_buf,
+                                     sequence_id, ft, nack_frags, nack_count);
+            /* NACKs do not consume the retry budget — keep waiting */
+            continue;
+        }
+
+        /* Timeout — full retransmit */
+        timeouts++;
+        if (timeouts > MAX_RETRIES) {
+            fprintf(stderr, "[UDP] Gave up on seq=%u after %d timeouts\n",
                     sequence_id, MAX_RETRIES);
+            break;
+        }
+        printf("[UDP] Timeout seq=%u — retransmitting all (timeout %d/%d)\n",
+               sequence_id, timeouts, MAX_RETRIES);
+        send_fragments(type, send_len, send_buf, sequence_id);
     }
 
+done:
+    free(crc_buf);
     sequence_id++;
 }
 
+/*
+ * Resume a previously interrupted transfer.
+ * Uses resume_seq as the seq_id (not the global counter) so the GS can
+ * merge these fragments with the ones it saved from the previous pass.
+ * Sends only fragments start_frag .. frag_total-1.
+ */
+void send_data_resume(PacketType type, uint32_t payload_length, uint8_t *data,
+                      uint16_t start_frag, uint16_t resume_seq) {
+    if (payload_length == 0 || data == NULL) return;
+
+    /* Rebuild the same send_buf (data + CRC32) as the original send_data() call */
+    uint8_t *crc_buf = malloc(payload_length + 4);
+    if (!crc_buf) {
+        fprintf(stderr, "[UDP] send_data_resume: malloc failed\n");
+        return;
+    }
+    uint32_t crc = crc32_compute(data, payload_length);
+    memcpy(crc_buf, data, payload_length);
+    crc_buf[payload_length]     = (crc >> 24) & 0xFF;
+    crc_buf[payload_length + 1] = (crc >> 16) & 0xFF;
+    crc_buf[payload_length + 2] = (crc >>  8) & 0xFF;
+    crc_buf[payload_length + 3] =  crc        & 0xFF;
+    uint32_t send_len = payload_length + 4;
+
+    uint16_t ft = frag_total_for(send_len);
+
+    printf("[UDP] Resuming seq=%u from frag %u/%u\n",
+           resume_seq, start_frag, ft);
+
+    if (send_fragments_from(type, send_len, crc_buf, resume_seq, start_frag) < 0)
+        goto done;
+
+    int timeouts = 0;
+    while (1) {
+        int result = wait_for_response(resume_seq);
+
+        if (result == WAIT_ACK) {
+            printf("[UDP] ACK received for resumed seq=%u\n", resume_seq);
+            break;
+        }
+        if (result == WAIT_NACK) {
+            printf("[UDP] NACK (resume) seq=%u — resending %u frags\n",
+                   resume_seq, nack_count);
+            send_fragments_selective(type, send_len, crc_buf,
+                                     resume_seq, ft, nack_frags, nack_count);
+            continue;
+        }
+        timeouts++;
+        if (timeouts > MAX_RETRIES) {
+            fprintf(stderr, "[UDP] Resume gave up on seq=%u after %d timeouts\n",
+                    resume_seq, MAX_RETRIES);
+            break;
+        }
+        send_fragments_from(type, send_len, crc_buf, resume_seq, start_frag);
+    }
+
+done:
+    free(crc_buf);
+    /* Note: sequence_id is NOT incremented — this is a resumed transfer */
+}
+
 int receive_packet(RawPacket *pkt) {
-    uint8_t           buf[MAX_PACKET_SIZE];
+    uint8_t            buf[MAX_PACKET_SIZE];
     struct sockaddr_in sender;
     socklen_t          sender_len = sizeof(sender);
 
@@ -219,7 +387,6 @@ int receive_packet(RawPacket *pkt) {
         fprintf(stderr, "[UDP] Invalid payload length: %u\n", pkt->payload_length);
         return -1;
     }
-
     if ((ssize_t)(HEADER_SIZE + pkt->payload_length) > n) {
         fprintf(stderr, "[UDP] Datagram shorter than declared payload\n");
         return -1;
@@ -228,7 +395,6 @@ int receive_packet(RawPacket *pkt) {
     if (pkt->payload_length > 0)
         memcpy(pkt->data, &buf[IDX_DATA_START], pkt->payload_length);
 
-    /* Verify checksum */
     buf[IDX_CRC_MSB] = 0x00;
     buf[IDX_CRC_LSB] = 0x00;
     uint16_t computed_crc = calculate_checksum(buf, HEADER_SIZE + pkt->payload_length);
@@ -238,10 +404,6 @@ int receive_packet(RawPacket *pkt) {
         return -1;
     }
 
-    /*
-     * Learn the GS address from the first incoming packet.
-     * After this, send_data() sends unicast instead of broadcast.
-     */
     if (!gs_addr_known) {
         gs_addr       = sender;
         gs_addr_known = 1;

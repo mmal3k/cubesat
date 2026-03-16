@@ -111,6 +111,39 @@ static int send_file(const char *path)
     return send_image(path);
 }
 
+static int send_file_from_fragment(const char *path, uint16_t start_frag,
+                                   uint16_t resume_seq)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "[IMG] Cannot open file for resume: %s\n", path);
+        return -1;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long file_size = ftell(f);
+    rewind(f);
+
+    if (file_size <= 0) {
+        fclose(f);
+        return -1;
+    }
+
+    uint8_t *buf = malloc((size_t)file_size);
+    if (!buf) { fclose(f); return -1; }
+
+    if (fread(buf, 1, (size_t)file_size, f) != (size_t)file_size) {
+        free(buf); fclose(f); return -1;
+    }
+    fclose(f);
+
+    printf("[TX] Resuming image: %s from frag %u (seq=%u)\n",
+           path, start_frag, resume_seq);
+    send_data_resume(PID_SCI_IMG, (uint32_t)file_size, buf, start_frag, resume_seq);
+    free(buf);
+    return 0;
+}
+
 static void send_latest_image(void)
 {
     const char *latest_img = "latest_image.bin";
@@ -156,16 +189,13 @@ static void send_beacon(void)
 
 int main(int argc, char *argv[])
 {
-    uint16_t local_port = 5001; /* Q7 listens here for commands    */
-    uint16_t gs_port = 5000;    /* GS listens here for beacons     */
-    const char *img_path = NULL;
+    uint16_t    local_port = 5001;  /* Q7 listens here for commands */
+    uint16_t    gs_port    = 5000;  /* GS listens here for beacons  */
+    const char *img_path   = NULL;
 
-    if (argc >= 2)
-        local_port = (uint16_t)atoi(argv[1]);
-    if (argc >= 3)
-        gs_port = (uint16_t)atoi(argv[2]);
-    if (argc >= 4)
-        img_path = argv[3];
+    if (argc >= 2) local_port = (uint16_t)atoi(argv[1]);
+    if (argc >= 3) gs_port    = (uint16_t)atoi(argv[2]);
+    if (argc >= 4) img_path   = argv[3];
 
     if (udp_init(local_port, gs_port) != 0)
     {
@@ -255,7 +285,6 @@ int main(int argc, char *argv[])
                 memcpy(path, pkt.data, pkt.payload_length);
                 path[pkt.payload_length] = '\0';
 
-                /* Reject path traversal attempts */
                 if (strstr(path, "..") != NULL)
                 {
                     fprintf(stderr, "[CMD] Path traversal rejected: %s\n", path);
@@ -264,6 +293,37 @@ int main(int argc, char *argv[])
                 {
                     printf("[CMD] Ground station requested file: %s\n", path);
                     send_file(path);
+                }
+            }
+        }
+        else if (pkt.type == PID_RESUME_REQ)
+        {
+            /* Payload: [resume_seq_MSB][resume_seq_LSB]
+             *          [start_frag_MSB][start_frag_LSB]
+             *          [filename bytes...] */
+            if (pkt.payload_length < 5)
+            {
+                fprintf(stderr, "[CMD] RESUME_REQ too short\n");
+            }
+            else
+            {
+                uint16_t resume_seq = ((uint16_t)pkt.data[0] << 8) | pkt.data[1];
+                uint16_t start_frag = ((uint16_t)pkt.data[2] << 8) | pkt.data[3];
+                uint16_t fname_len  = pkt.payload_length - 4;
+
+                char path[MAX_PAYLOAD_SIZE + 1];
+                memcpy(path, pkt.data + 4, fname_len);
+                path[fname_len] = '\0';
+
+                if (strstr(path, "..") != NULL)
+                {
+                    fprintf(stderr, "[CMD] Resume path traversal rejected: %s\n", path);
+                }
+                else
+                {
+                    printf("[CMD] Resume requested: %s from frag %u (seq=%u)\n",
+                           path, start_frag, resume_seq);
+                    send_file_from_fragment(path, start_frag, resume_seq);
                 }
             }
         }

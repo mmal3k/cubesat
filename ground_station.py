@@ -7,6 +7,11 @@ Flow:
   2. Learns the Q7 address from the first recvfrom()
   3. Sends commands unicast to Q7, receives and reassembles responses
 
+Resume flow (across passes):
+  - Incomplete messages are saved to partial/ on timeout
+  - On next beacon, GS sends RESUME_REQ for each saved partial file
+  - Q7 resumes sending from the last received fragment
+
 Usage:
   python3 ground_station.py [gs_port] [q7_port]
   Default: gs_port=5000, q7_port=5001
@@ -17,6 +22,10 @@ import threading
 import sys
 import io
 import os
+import json
+import time
+import glob
+import binascii
 from collections import deque
 
 try:
@@ -44,29 +53,35 @@ IDX_CRC_LSB      = 10
 
 PID_CMD_CONTROL  = 0x10
 PID_PING         = 0x11
+PID_LIST_FILES   = 0x20
+PID_LATEST_IMG   = 0x21
+PID_GET_FILE     = 0x22
+PID_RESUME_REQ   = 0x30
 PID_TELEMETRY_HK = 0x50
 PID_SCI_IMG      = 0x60
 PID_SCI_TXT      = 0x61
 PID_ACK          = 0xAA
+PID_NACK         = 0xBB
 PID_ERROR        = 0xEE
-# FIX 5: added missing constants used in cmd_menu
-PID_LIST_FILES   = 0x20
-PID_LATEST_IMG   = 0x21
-PID_GET_FILE     = 0x22
 
-# FIX 6: added missing entries so received packets log correctly
 PACKET_TYPE_NAMES = {
     PID_CMD_CONTROL:  "CMD_CONTROL",
     PID_PING:         "PING",
+    PID_LIST_FILES:   "LIST_FILES",
+    PID_LATEST_IMG:   "LATEST_IMG",
+    PID_GET_FILE:     "GET_FILE",
+    PID_RESUME_REQ:   "RESUME_REQ",
     PID_TELEMETRY_HK: "TELEMETRY_HK",
     PID_SCI_IMG:      "SCI_IMG",
     PID_SCI_TXT:      "SCI_TXT",
     PID_ACK:          "ACK",
+    PID_NACK:         "NACK",
     PID_ERROR:        "ERROR",
-    PID_LIST_FILES:   "LIST_FILES",
-    PID_LATEST_IMG:   "LATEST_IMG",
-    PID_GET_FILE:     "GET_FILE",
 }
+
+# ── Tuning ──────────────────────────────────────────────────────
+FRAGMENT_TIMEOUT_S = 3    # seconds after last frag before sending NACK
+PARTIAL_DIR        = 'partial'
 
 # ── Sequence counter ────────────────────────────────────────────
 _seq_id   = 0
@@ -77,8 +92,17 @@ _q7_addr       = None
 _q7_addr_lock  = threading.Lock()
 _q7_addr_ready = threading.Event()
 
+# ── Shared reassembly dict (receive_loop + timeout_checker) ─────
+# seq_id → {total, type, frags, last_frag_time, filename}
+_reassembly      = {}
+_reassembly_lock = threading.Lock()
+
 # ── Duplicate detection — keep last 256 seen seq_ids ────────────
 _seen_seqs = deque(maxlen=256)
+
+# ── Last requested filename (for resume tracking) ────────────────
+_last_requested_file      = None
+_last_requested_file_lock = threading.Lock()
 
 
 # ── Checksum ────────────────────────────────────────────────────
@@ -86,27 +110,43 @@ def calculate_checksum(data: bytes) -> int:
     return sum(data) & 0xFFFF
 
 
-# ── ACK builder ─────────────────────────────────────────────────
-def build_ack(seq_id: int) -> bytes:
+# ── Packet builders ─────────────────────────────────────────────
+def _build_control_packet(pkt_type: int, seq_id: int, payload: bytes) -> bytes:
+    """Build a single-fragment packet with an explicit seq_id (for ACK/NACK)."""
+    chunk_size = len(payload)
     header = bytearray(HEADER_SIZE)
-    header[IDX_TYPE]         = PID_ACK
-    header[IDX_SEQ_MSB]      = (seq_id >> 8) & 0xFF
-    header[IDX_SEQ_LSB]      =  seq_id       & 0xFF
+    header[IDX_TYPE]         = pkt_type
+    header[IDX_SEQ_MSB]      = (seq_id     >> 8) & 0xFF
+    header[IDX_SEQ_LSB]      =  seq_id            & 0xFF
     header[IDX_FRAG_ID_MSB]  = 0
     header[IDX_FRAG_ID_LSB]  = 0
     header[IDX_FRAG_TOT_MSB] = 0
     header[IDX_FRAG_TOT_LSB] = 1
-    header[IDX_LEN_MSB]      = 0
-    header[IDX_LEN_LSB]      = 0
+    header[IDX_LEN_MSB]      = (chunk_size >> 8) & 0xFF
+    header[IDX_LEN_LSB]      =  chunk_size        & 0xFF
     header[IDX_CRC_MSB]      = 0
     header[IDX_CRC_LSB]      = 0
-    crc = calculate_checksum(bytes(header))
+    raw = bytes(header) + payload
+    crc = calculate_checksum(raw)
     header[IDX_CRC_MSB] = (crc >> 8) & 0xFF
     header[IDX_CRC_LSB] =  crc       & 0xFF
-    return bytes(header)
+    return bytes(header) + payload
 
 
-# ── Packet builder ──────────────────────────────────────────────
+def build_ack(seq_id: int) -> bytes:
+    return _build_control_packet(PID_ACK, seq_id, b'')
+
+
+def build_nack(seq_id: int, missing_frags: list) -> bytes:
+    """Build a NACK with the list of missing fragment IDs."""
+    max_frags = (MAX_PAYLOAD_SIZE - 2) // 2   # 121
+    frags = missing_frags[:max_frags]
+    payload = len(frags).to_bytes(2, 'big')
+    for fid in frags:
+        payload += fid.to_bytes(2, 'big')
+    return _build_control_packet(PID_NACK, seq_id, payload)
+
+
 def build_packets(pkt_type: int, payload: bytes = b'') -> list:
     global _seq_id
     frag_total = max(1, (len(payload) + MAX_PAYLOAD_SIZE - 1) // MAX_PAYLOAD_SIZE)
@@ -137,7 +177,7 @@ def build_packets(pkt_type: int, payload: bytes = b'') -> list:
         raw = bytes(header) + chunk
         crc = calculate_checksum(raw)
         header[IDX_CRC_MSB] = (crc >> 8) & 0xFF
-        header[IDX_CRC_LSB] =  crc        & 0xFF
+        header[IDX_CRC_LSB] =  crc       & 0xFF
 
         packets.append(bytes(header) + chunk)
 
@@ -201,13 +241,153 @@ def _handle_image(data: bytes, seq_id: int):
         print(f"     Could not display image: {e}")
 
 
+# ── Partial transfer persistence ────────────────────────────────
+def save_partial(seq_id: int, msg: dict):
+    """Save an incomplete message to disk for resume on next pass."""
+    os.makedirs(PARTIAL_DIR, exist_ok=True)
+    meta = {
+        'seq_id':        seq_id,
+        'pkt_type':      msg['type'],
+        'frag_total':    msg['total'],
+        'received_frags': sorted(msg['frags'].keys()),
+        'filename':      msg.get('filename'),
+    }
+    meta_path = os.path.join(PARTIAL_DIR, f'seq_{seq_id:05d}.json')
+    with open(meta_path, 'w') as f:
+        json.dump(meta, f)
+    for frag_id, data in msg['frags'].items():
+        frag_path = os.path.join(PARTIAL_DIR,
+                                 f'seq_{seq_id:05d}_frag_{frag_id:05d}.bin')
+        with open(frag_path, 'wb') as f:
+            f.write(data)
+    print(f"[GS] Partial saved: seq={seq_id} "
+          f"({len(msg['frags'])}/{msg['total']} frags, file={msg.get('filename')})")
+
+
+def _cleanup_partial(seq_id: int):
+    """Delete saved partial files for a completed transfer."""
+    for path in glob.glob(os.path.join(PARTIAL_DIR, f'seq_{seq_id:05d}*.bin')):
+        os.remove(path)
+    meta_path = os.path.join(PARTIAL_DIR, f'seq_{seq_id:05d}.json')
+    if os.path.exists(meta_path):
+        os.remove(meta_path)
+
+
+def load_and_resume_partials(sock):
+    """
+    Called after beacon is received.
+    For each saved partial transfer, pre-populate reassembly and send RESUME_REQ.
+    """
+    if not os.path.exists(PARTIAL_DIR):
+        return
+
+    for meta_path in sorted(glob.glob(os.path.join(PARTIAL_DIR, 'seq_*.json'))):
+        try:
+            with open(meta_path) as f:
+                meta = json.load(f)
+        except Exception:
+            continue
+
+        seq_id     = meta['seq_id']
+        frag_total = meta['frag_total']
+        received   = set(meta['received_frags'])
+        filename   = meta.get('filename')
+
+        missing = [i for i in range(frag_total) if i not in received]
+        if not missing:
+            _cleanup_partial(seq_id)
+            continue
+
+        if not filename:
+            print(f"[GS] Cannot resume seq={seq_id}: no filename stored")
+            continue
+
+        last_received = max(received)
+        start_frag    = last_received + 1
+
+        print(f"[GS] Resuming partial transfer: seq={seq_id}  "
+              f"have {len(received)}/{frag_total} frags  "
+              f"file={filename}  resuming from frag {start_frag}")
+
+        # Load saved fragments back into the reassembly dict
+        frags = {}
+        for frag_id in received:
+            frag_path = os.path.join(PARTIAL_DIR,
+                                     f'seq_{seq_id:05d}_frag_{frag_id:05d}.bin')
+            if os.path.exists(frag_path):
+                with open(frag_path, 'rb') as f:
+                    frags[frag_id] = f.read()
+
+        with _reassembly_lock:
+            _reassembly[seq_id] = {
+                'total':          frag_total,
+                'type':           meta['pkt_type'],
+                'frags':          frags,
+                'last_frag_time': time.time(),
+                'filename':       filename,
+            }
+
+        # Remove from _seen_seqs so the reassembled message isn't discarded
+        try:
+            _seen_seqs.remove(seq_id)
+        except ValueError:
+            pass
+
+        # Ask Q7 to resume
+        # RESUME_REQ payload: [seq_MSB][seq_LSB][start_frag_MSB][start_frag_LSB][filename]
+        resume_payload = (seq_id    .to_bytes(2, 'big') +
+                          start_frag.to_bytes(2, 'big') +
+                          filename.encode())
+        send_packet(sock, PID_RESUME_REQ, resume_payload)
+
+
+# ── Fragment timeout checker (background thread) ─────────────────
+def timeout_checker(sock):
+    """
+    Runs every second. If a message has not received all its fragments
+    within FRAGMENT_TIMEOUT_S, send a NACK listing the missing ones
+    and save the partial data to disk.
+    """
+    while True:
+        time.sleep(1)
+        now = time.time()
+
+        with _reassembly_lock:
+            stale = [
+                (seq_id, msg) for seq_id, msg in _reassembly.items()
+                if now - msg['last_frag_time'] > FRAGMENT_TIMEOUT_S
+            ]
+
+        for seq_id, msg in stale:
+            missing = [i for i in range(msg['total']) if i not in msg['frags']]
+            if not missing:
+                continue  # all frags arrived, reassembly logic will clean up
+
+            with _q7_addr_lock:
+                q7_addr = _q7_addr
+
+            if q7_addr is not None:
+                nack_pkt = build_nack(seq_id, missing)
+                sock.sendto(nack_pkt, q7_addr)
+                print(f"\n[GS] NACK seq={seq_id}  missing {len(missing)} frags: "
+                      f"{missing[:10]}{'...' if len(missing) > 10 else ''}")
+                print("> ", end='', flush=True)
+
+            # Reset timer so we don't spam NACKs every second
+            with _reassembly_lock:
+                if seq_id in _reassembly:
+                    _reassembly[seq_id]['last_frag_time'] = now
+
+            # Save to disk so we can resume next pass
+            save_partial(seq_id, msg)
+
+
 # ── Receive thread ───────────────────────────────────────────────
 def receive_loop(sock, q7_port: int):
     global _q7_addr
-    reassembly = {}  # seq_id -> {'total': N, 'type': T, 'frags': {frag_id: bytes}}
 
     # Packet types that should never be ACKed
-    NO_ACK_TYPES = {PID_PING, PID_ACK, PID_ERROR}
+    NO_ACK_TYPES = {PID_PING, PID_ACK, PID_NACK, PID_ERROR, PID_RESUME_REQ}
 
     while True:
         try:
@@ -223,6 +403,9 @@ def receive_loop(sock, q7_port: int):
                 print(f"\n[GS] Beacon from {addr[0]} — pass window active")
                 print(f"[GS] Sending commands to {addr[0]}:{q7_port}")
                 print("> ", end='', flush=True)
+                # Check for incomplete transfers from previous pass
+                threading.Thread(target=load_and_resume_partials,
+                                 args=(sock,), daemon=True).start()
 
         pkt = parse_packet(data)
         if pkt is None:
@@ -233,20 +416,40 @@ def receive_loop(sock, q7_port: int):
         frag_total = pkt['frag_total']
         pkt_type   = pkt['type']
 
-        # Accumulate fragments
-        if seq_id not in reassembly:
-            reassembly[seq_id] = {'total': frag_total, 'type': pkt_type, 'frags': {}}
-        reassembly[seq_id]['frags'][frag_id] = pkt['payload']
+        # Accumulate fragments into shared reassembly dict
+        with _reassembly_lock:
+            if seq_id not in _reassembly:
+                # Track filename for file transfers so we can resume them
+                filename = None
+                if pkt_type in (PID_SCI_IMG, PID_SCI_TXT):
+                    with _last_requested_file_lock:
+                        filename = _last_requested_file
+                _reassembly[seq_id] = {
+                    'total':          frag_total,
+                    'type':           pkt_type,
+                    'frags':          {},
+                    'last_frag_time': time.time(),
+                    'filename':       filename,
+                }
+            _reassembly[seq_id]['frags'][frag_id]    = pkt['payload']
+            _reassembly[seq_id]['last_frag_time']    = time.time()
+            frags_received = len(_reassembly[seq_id]['frags'])
+            entry_total    = _reassembly[seq_id]['total']
 
         # Wait until all fragments of this message have arrived
-        if len(reassembly[seq_id]['frags']) < frag_total:
+        if frags_received < entry_total:
             continue
 
         # ── Full message reassembled ──────────────────────────────
+        with _reassembly_lock:
+            if seq_id not in _reassembly:
+                continue  # already processed by another iteration
+            msg          = _reassembly.pop(seq_id)
+            filename_ref = msg.get('filename')
+
         full_payload = b''.join(
-            reassembly[seq_id]['frags'][i] for i in range(frag_total)
+            msg['frags'][i] for i in range(frag_total)
         )
-        del reassembly[seq_id]
 
         with _q7_addr_lock:
             q7_addr = _q7_addr
@@ -264,12 +467,29 @@ def receive_loop(sock, q7_port: int):
 
         _seen_seqs.append(seq_id)
 
+        # Clean up any saved partial files for this transfer
+        _cleanup_partial(seq_id)
+
+        # ── Verify message-level CRC32 (last 4 bytes appended by Q7) ─
+        msg_crc_ok = True
+        if len(full_payload) >= 4:
+            recv_crc32     = int.from_bytes(full_payload[-4:], 'big')
+            computed_crc32 = binascii.crc32(full_payload[:-4]) & 0xFFFFFFFF
+            msg_crc_ok     = (recv_crc32 == computed_crc32)
+            full_payload   = full_payload[:-4]  # strip CRC bytes
+
         # ── Process new message ───────────────────────────────────
-        type_name = PACKET_TYPE_NAMES.get(pkt_type, f"UNKNOWN(0x{pkt_type:02X})")
-        crc_str   = "OK" if pkt['crc_ok'] else "FAIL"
+        type_name    = PACKET_TYPE_NAMES.get(pkt_type, f"UNKNOWN(0x{pkt_type:02X})")
+        frag_crc_str = "OK" if pkt['crc_ok'] else "FAIL"
+        msg_crc_str  = "OK" if msg_crc_ok    else "FAIL"
 
         print(f"\n[RX] [{type_name}]  seq={seq_id}  "
-              f"len={len(full_payload)}  crc={crc_str}")
+              f"len={len(full_payload)}  frag_crc={frag_crc_str}  msg_crc={msg_crc_str}")
+
+        if not msg_crc_ok:
+            print("     [!] Message CRC failed — data corrupted, discarding")
+            print("> ", end='', flush=True)
+            continue
 
         if pkt_type == PID_SCI_IMG:
             _handle_image(full_payload, seq_id)
@@ -298,7 +518,8 @@ def send_packet(sock, pkt_type: int, payload: bytes = b''):
     print(f"[TX] [{name}]  {len(payload)} bytes  → {addr[0]}:{addr[1]}")
 
 
-def cmd_menu(conn):
+# ── Command menu ─────────────────────────────────────────────────
+def cmd_menu(sock):
     while True:
         print()
         print("CMD MENU:")
@@ -311,14 +532,17 @@ def cmd_menu(conn):
         choice = input("cmd> ").strip()
 
         if choice == "1":
-            send_packet(conn, PID_LIST_FILES)
+            send_packet(sock, PID_LIST_FILES)
 
         elif choice == "2":
-            send_packet(conn, PID_LATEST_IMG)
+            send_packet(sock, PID_LATEST_IMG)
 
         elif choice == "3":
             path = input("Enter file path: ").strip()
-            send_packet(conn, PID_GET_FILE, path.encode())
+            with _last_requested_file_lock:
+                global _last_requested_file
+                _last_requested_file = path
+            send_packet(sock, PID_GET_FILE, path.encode())
 
         elif choice == "back":
             break
@@ -329,8 +553,8 @@ def cmd_menu(conn):
 
 # ── Main ─────────────────────────────────────────────────────────
 def main():
-    gs_port = 5000   # GS listens here  (Q7 broadcasts beacons to this port)
-    q7_port = 5001   # Q7 listens here  (GS sends commands to this port)
+    gs_port = 5000
+    q7_port = 5001
 
     if len(sys.argv) >= 2: gs_port = int(sys.argv[1])
     if len(sys.argv) >= 3: q7_port = int(sys.argv[2])
@@ -344,18 +568,17 @@ def main():
     print("╚══════════════════════════════════════════╝")
     print(f"Listening for beacons on port {gs_port}")
     print(f"Commands will go to Q7 port  {q7_port}")
-    # print("Commands:")
-    # print("  ping            - send a PING to the Q7")
-    # print("  ack             - send an ACK")
-    # print("  cmd             - open command menu")
-    # print("  quit            - disconnect")
-    # print()
-    print("Commands:  ping | cmd <text> | quit")
+    print(f"Fragment timeout: {FRAGMENT_TIMEOUT_S}s  |  Partials saved to: {PARTIAL_DIR}/")
+    print()
+    print("Commands:  ping | cmd | quit")
     print("Waiting for Q7 beacon...")
     print()
 
     rx = threading.Thread(target=receive_loop, args=(sock, q7_port), daemon=True)
     rx.start()
+
+    tc = threading.Thread(target=timeout_checker, args=(sock,), daemon=True)
+    tc.start()
 
     while True:
         try:
@@ -374,7 +597,7 @@ def main():
         elif line == 'quit':
             break
         else:
-            print("Unknown command. Try: ping | ack | cmd | quit")
+            print("Unknown command. Try: ping | cmd | quit")
 
     sock.close()
     print("[GS] Closed.")

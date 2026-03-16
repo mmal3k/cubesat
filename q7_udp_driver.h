@@ -25,17 +25,18 @@
 
 typedef enum
 {
-    PID_CMD_CONTROL = 0x10,
-    PID_PING = 0x11,
+    PID_CMD_CONTROL  = 0x10,
+    PID_PING         = 0x11,
+    PID_LIST_FILES   = 0x20,
+    PID_LATEST_IMG   = 0x21,
+    PID_GET_FILE     = 0x22,
+    PID_RESUME_REQ   = 0x30,
     PID_TELEMETRY_HK = 0x50,
-    PID_SCI_IMG = 0x60,
-    PID_SCI_TXT = 0x61,
-    PID_ACK = 0xAA,
-    PID_ERROR = 0xEE, /* FIX 1: missing comma was here */
-    /* FIX 2: values aligned with ground_station.py */
-    PID_LIST_FILES = 0x20,
-    PID_LATEST_IMG = 0x21,
-    PID_GET_FILE = 0x22
+    PID_SCI_IMG      = 0x60,
+    PID_SCI_TXT      = 0x61,
+    PID_ACK          = 0xAA,
+    PID_NACK         = 0xBB,
+    PID_ERROR        = 0xEE
 } PacketType;
 
 typedef struct
@@ -61,6 +62,8 @@ int  udp_init(uint16_t local_port, uint16_t gs_port);
 void udp_close(void);
 int  udp_get_fd(void);
 void send_data(PacketType type, uint32_t payload_length, uint8_t *data);
-int receive_packet(RawPacket *pkt);
+void send_data_resume(PacketType type, uint32_t payload_length, uint8_t *data,
+                      uint16_t start_frag, uint16_t resume_seq);
+int  receive_packet(RawPacket *pkt);
 
 #endif
