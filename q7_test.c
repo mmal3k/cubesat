@@ -9,7 +9,8 @@
 
 #include "q7_udp_driver.h"
 
-#define BEACON_INTERVAL_S 10 /* send PING + TELEMETRY_HK every N seconds */
+#define BEACON_INTERVAL_S 30 /* send PING + TELEMETRY_HK every N seconds */
+#define IMAGE_DIR "./data/images"  /* default image directory on Q7 */
 
 /* ------------------------------------------------------------------ */
 /*  File helpers                                                        */
@@ -51,6 +52,11 @@ static int send_image(const char *path)
         return -1;
     }
     fclose(f);
+
+    /* Announce the filename so GS can store it for cross-pass resume */
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    send_data(PID_FILE_HDR, (uint32_t)strlen(base), (uint8_t *)base);
 
     printf("[TX] Sending image: %s (%ld bytes)\n", path, file_size);
     send_data(PID_SCI_IMG, (uint32_t)file_size, buf);
@@ -168,7 +174,7 @@ static void send_file_list(const char *dir_path)
  * FIX 1: sends an error response if nothing is found so GS never waits
  *        in silence.
  */
-static int send_file_from_fragment(const char *path, uint16_t start_frag,
+static int send_file_from_fragment(const char *path, uint32_t start_frag,
                                    uint16_t resume_seq)
 {
     FILE *f = fopen(path, "rb");
@@ -283,6 +289,10 @@ static const char *packet_type_name(PacketType type)
         return "latest_img";
     case PID_GET_FILE:
         return "get_file";
+    case PID_RESUME_REQ:
+        return "resume_req";
+    case PID_NACK:
+        return "nack";
     default:
         return "unknown";
     }
@@ -374,12 +384,12 @@ int main(int argc, char *argv[])
         else if (pkt.type == PID_LIST_FILES)
         {
             printf("[CMD] Ground station requested file list\n");
-            send_file_list(".");
+            send_file_list(IMAGE_DIR);
         }
         else if (pkt.type == PID_LATEST_IMG)
         {
             printf("[CMD] Ground station requested latest image\n");
-            send_latest_image(".");
+            send_latest_image(IMAGE_DIR);
         }
         else if (pkt.type == PID_GET_FILE)
         {
@@ -391,44 +401,58 @@ int main(int argc, char *argv[])
             }
             else
             {
-                char path[MAX_PAYLOAD_SIZE + 1];
-                memcpy(path, pkt.data, pkt.payload_length);
-                path[pkt.payload_length] = '\0';
+                char name[MAX_PAYLOAD_SIZE + 1];
+                memcpy(name, pkt.data, pkt.payload_length);
+                name[pkt.payload_length] = '\0';
 
-                if (strstr(path, "..") != NULL)
-                    fprintf(stderr, "[CMD] Path traversal rejected: %s\n", path);
+                if (strstr(name, "..") != NULL)
+                {
+                    fprintf(stderr, "[CMD] Path traversal rejected: %s\n", name);
+                }
                 else
                 {
+                    char path[sizeof(IMAGE_DIR) + MAX_PAYLOAD_SIZE + 2];
+                    if (name[0] == '/')
+                        snprintf(path, sizeof(path), "%s", name);
+                    else
+                        snprintf(path, sizeof(path), "%s/%s", IMAGE_DIR, name);
                     printf("[CMD] Ground station requested file: %s\n", path);
-                    send_image(path); /* removed pointless send_file wrapper */
+                    send_image(path);
                 }
             }
         }
         else if (pkt.type == PID_RESUME_REQ)
         {
             /* Payload: [resume_seq_MSB][resume_seq_LSB]
-             *          [start_frag_MSB][start_frag_LSB]
+             *          [start_frag_B2][start_frag_B1][start_frag_B0]
              *          [filename bytes...] */
-            if (pkt.payload_length < 5)
+            if (pkt.payload_length < 6)
             {
                 fprintf(stderr, "[CMD] RESUME_REQ too short\n");
             }
             else
             {
                 uint16_t resume_seq = ((uint16_t)pkt.data[0] << 8) | pkt.data[1];
-                uint16_t start_frag = ((uint16_t)pkt.data[2] << 8) | pkt.data[3];
-                uint16_t fname_len  = pkt.payload_length - 4;
+                uint32_t start_frag = ((uint32_t)pkt.data[2] << 16)
+                                    | ((uint32_t)pkt.data[3] <<  8)
+                                    |  (uint32_t)pkt.data[4];
+                uint16_t fname_len  = pkt.payload_length - 5;
 
-                char path[MAX_PAYLOAD_SIZE + 1];
-                memcpy(path, pkt.data + 4, fname_len);
-                path[fname_len] = '\0';
+                char name[MAX_PAYLOAD_SIZE + 1];
+                memcpy(name, pkt.data + 4, fname_len);
+                name[fname_len] = '\0';
 
-                if (strstr(path, "..") != NULL)
+                if (strstr(name, "..") != NULL)
                 {
-                    fprintf(stderr, "[CMD] Resume path traversal rejected: %s\n", path);
+                    fprintf(stderr, "[CMD] Resume path traversal rejected: %s\n", name);
                 }
                 else
                 {
+                    char path[sizeof(IMAGE_DIR) + MAX_PAYLOAD_SIZE + 2];
+                    if (name[0] == '/')
+                        snprintf(path, sizeof(path), "%s", name);
+                    else
+                        snprintf(path, sizeof(path), "%s/%s", IMAGE_DIR, name);
                     printf("[CMD] Resume requested: %s from frag %u (seq=%u)\n",
                            path, start_frag, resume_seq);
                     send_file_from_fragment(path, start_frag, resume_seq);

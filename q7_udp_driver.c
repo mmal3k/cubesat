@@ -19,8 +19,8 @@ static int               gs_addr_known = 0;
 static uint16_t          sequence_id   = 0;
 
 /* NACK data filled by wait_for_response() */
-#define MAX_NACK_FRAGS   ((MAX_PAYLOAD_SIZE - 2) / 2)   /* 121 */
-static uint16_t nack_frags[MAX_NACK_FRAGS];
+#define MAX_NACK_FRAGS   ((MAX_PAYLOAD_SIZE - 2) / 3)   /* 80 */
+static uint32_t nack_frags[MAX_NACK_FRAGS];
 static uint16_t nack_count = 0;
 
 /* Return codes for wait_for_response() */
@@ -61,7 +61,7 @@ int udp_init(uint16_t local_port, uint16_t gs_port) {
 
     memset(&gs_addr, 0, sizeof(gs_addr));
     gs_addr.sin_family      = AF_INET;
-    gs_addr.sin_addr.s_addr = INADDR_BROADCAST;
+    inet_pton(AF_INET, "255.255.255.255", &gs_addr.sin_addr);
     gs_addr.sin_port        = htons(gs_port);
     gs_addr_known           = 0;
 
@@ -102,29 +102,31 @@ static uint32_t crc32_compute(const uint8_t *data, uint32_t len) {
 /* ── Fragment helpers ───────────────────────────────────────────── */
 
 /* Compute total number of fragments for a given payload length */
-static uint16_t frag_total_for(uint32_t len) {
-    return (len == 0) ? 1 : (uint16_t)((len + MAX_PAYLOAD_SIZE - 1) / MAX_PAYLOAD_SIZE);
+static uint32_t frag_total_for(uint32_t len) {
+    return (len == 0) ? 1 : (len + MAX_PAYLOAD_SIZE - 1) / MAX_PAYLOAD_SIZE;
 }
 
 /* Build and send a single fragment */
 static int send_one_fragment(PacketType type, uint32_t total_len, uint8_t *data,
-                              uint16_t seq, uint16_t frag_id, uint16_t frag_total) {
+                              uint16_t seq, uint32_t frag_id, uint32_t frag_total) {
     uint8_t  packet[MAX_PACKET_SIZE];
-    uint32_t offset     = (uint32_t)frag_id * MAX_PAYLOAD_SIZE;
+    uint32_t offset     = frag_id * MAX_PAYLOAD_SIZE;
     uint16_t chunk_size = (total_len - offset < MAX_PAYLOAD_SIZE)
                         ? (uint16_t)(total_len - offset) : MAX_PAYLOAD_SIZE;
 
-    packet[IDX_TYPE]         = (uint8_t)type;
-    packet[IDX_SEQ_MSB]      = (seq        >> 8) & 0xFF;
-    packet[IDX_SEQ_LSB]      =  seq               & 0xFF;
-    packet[IDX_FRAG_ID_MSB]  = (frag_id    >> 8) & 0xFF;
-    packet[IDX_FRAG_ID_LSB]  =  frag_id           & 0xFF;
-    packet[IDX_FRAG_TOT_MSB] = (frag_total >> 8) & 0xFF;
-    packet[IDX_FRAG_TOT_LSB] =  frag_total        & 0xFF;
-    packet[IDX_LEN_MSB]      = (chunk_size >> 8) & 0xFF;
-    packet[IDX_LEN_LSB]      =  chunk_size        & 0xFF;
-    packet[IDX_CRC_MSB]      = 0x00;
-    packet[IDX_CRC_LSB]      = 0x00;
+    packet[IDX_TYPE]          = (uint8_t)type;
+    packet[IDX_SEQ_MSB]       = (seq        >> 8) & 0xFF;
+    packet[IDX_SEQ_LSB]       =  seq               & 0xFF;
+    packet[IDX_FRAG_ID_MSB]   = (frag_id    >> 16) & 0xFF;
+    packet[IDX_FRAG_ID_MID]   = (frag_id    >>  8) & 0xFF;
+    packet[IDX_FRAG_ID_LSB]   =  frag_id            & 0xFF;
+    packet[IDX_FRAG_TOT_MSB]  = (frag_total >> 16) & 0xFF;
+    packet[IDX_FRAG_TOT_MID]  = (frag_total >>  8) & 0xFF;
+    packet[IDX_FRAG_TOT_LSB]  =  frag_total         & 0xFF;
+    packet[IDX_LEN_MSB]       = (chunk_size >>  8) & 0xFF;
+    packet[IDX_LEN_LSB]       =  chunk_size         & 0xFF;
+    packet[IDX_CRC_MSB]       = 0x00;
+    packet[IDX_CRC_LSB]       = 0x00;
 
     if (chunk_size > 0 && data != NULL)
         memcpy(&packet[IDX_DATA_START], &data[offset], chunk_size);
@@ -146,8 +148,8 @@ static int send_one_fragment(PacketType type, uint32_t total_len, uint8_t *data,
 /* Send all fragments (frag 0 .. frag_total-1) */
 static int send_fragments(PacketType type, uint32_t total_len,
                            uint8_t *data, uint16_t seq) {
-    uint16_t ft = frag_total_for(total_len);
-    for (uint16_t fid = 0; fid < ft; fid++)
+    uint32_t ft = frag_total_for(total_len);
+    for (uint32_t fid = 0; fid < ft; fid++)
         if (send_one_fragment(type, total_len, data, seq, fid, ft) < 0)
             return -1;
     return 0;
@@ -156,8 +158,8 @@ static int send_fragments(PacketType type, uint32_t total_len,
 /* Send only the missing fragments listed in frag_ids[] */
 static int send_fragments_selective(PacketType type, uint32_t total_len,
                                      uint8_t *data, uint16_t seq,
-                                     uint16_t frag_total,
-                                     uint16_t *frag_ids, uint16_t n) {
+                                     uint32_t frag_total,
+                                     uint32_t *frag_ids, uint16_t n) {
     for (uint16_t i = 0; i < n; i++)
         if (send_one_fragment(type, total_len, data, seq, frag_ids[i], frag_total) < 0)
             return -1;
@@ -166,9 +168,9 @@ static int send_fragments_selective(PacketType type, uint32_t total_len,
 
 /* Send fragments start_frag .. frag_total-1 (for resume) */
 static int send_fragments_from(PacketType type, uint32_t total_len,
-                                uint8_t *data, uint16_t seq, uint16_t start_frag) {
-    uint16_t ft = frag_total_for(total_len);
-    for (uint16_t fid = start_frag; fid < ft; fid++)
+                                uint8_t *data, uint16_t seq, uint32_t start_frag) {
+    uint32_t ft = frag_total_for(total_len);
+    for (uint32_t fid = start_frag; fid < ft; fid++)
         if (send_one_fragment(type, total_len, data, seq, fid, ft) < 0)
             return -1;
     return 0;
@@ -215,13 +217,14 @@ static int wait_for_response(uint16_t expected_seq) {
 
         if (pkt.type == PID_NACK && pkt.seq_id == expected_seq) {
             /* Parse missing fragment list from payload:
-             * [n_MSB][n_LSB][frag0_MSB][frag0_LSB]... */
+             * [n_MSB][n_LSB][frag0_B2][frag0_B1][frag0_B0]... (3 bytes per frag) */
             if (pkt.payload_length < 2) continue;
             nack_count = ((uint16_t)pkt.data[0] << 8) | pkt.data[1];
             if (nack_count > MAX_NACK_FRAGS) nack_count = MAX_NACK_FRAGS;
             for (uint16_t i = 0; i < nack_count; i++)
-                nack_frags[i] = ((uint16_t)pkt.data[2 + i*2] << 8)
-                               | pkt.data[3 + i*2];
+                nack_frags[i] = ((uint32_t)pkt.data[2 + i*3] << 16)
+                              | ((uint32_t)pkt.data[3 + i*3] <<  8)
+                              |  (uint32_t)pkt.data[4 + i*3];
             return WAIT_NACK;
         }
 
@@ -276,7 +279,7 @@ void send_data(PacketType type, uint32_t payload_length, uint8_t *data) {
             printf("[UDP] NACK seq=%u — resending %u missing frags\n",
                    sequence_id, nack_count);
             send_fragments_selective(type, send_len, send_buf,
-                                     sequence_id, ft, nack_frags, nack_count);
+                                     sequence_id, ft, nack_frags, (uint16_t)nack_count);
             /* NACKs do not consume the retry budget — keep waiting */
             continue;
         }
@@ -305,7 +308,7 @@ done:
  * Sends only fragments start_frag .. frag_total-1.
  */
 void send_data_resume(PacketType type, uint32_t payload_length, uint8_t *data,
-                      uint16_t start_frag, uint16_t resume_seq) {
+                      uint32_t start_frag, uint16_t resume_seq) {
     if (payload_length == 0 || data == NULL) return;
 
     /* Rebuild the same send_buf (data + CRC32) as the original send_data() call */
@@ -342,7 +345,7 @@ void send_data_resume(PacketType type, uint32_t payload_length, uint8_t *data,
             printf("[UDP] NACK (resume) seq=%u — resending %u frags\n",
                    resume_seq, nack_count);
             send_fragments_selective(type, send_len, crc_buf,
-                                     resume_seq, ft, nack_frags, nack_count);
+                                     resume_seq, ft, nack_frags, (uint16_t)nack_count);
             continue;
         }
         timeouts++;
@@ -376,10 +379,10 @@ int receive_packet(RawPacket *pkt) {
     }
 
     pkt->type           = (PacketType)buf[IDX_TYPE];
-    pkt->seq_id         = ((uint16_t)buf[IDX_SEQ_MSB]      << 8) | buf[IDX_SEQ_LSB];
-    pkt->frag_id        = ((uint16_t)buf[IDX_FRAG_ID_MSB]  << 8) | buf[IDX_FRAG_ID_LSB];
-    pkt->frag_total     = ((uint16_t)buf[IDX_FRAG_TOT_MSB] << 8) | buf[IDX_FRAG_TOT_LSB];
-    pkt->payload_length = ((uint16_t)buf[IDX_LEN_MSB]      << 8) | buf[IDX_LEN_LSB];
+    pkt->seq_id         = ((uint16_t)buf[IDX_SEQ_MSB]       << 8)  |  buf[IDX_SEQ_LSB];
+    pkt->frag_id        = ((uint32_t)buf[IDX_FRAG_ID_MSB]   << 16) | ((uint32_t)buf[IDX_FRAG_ID_MID]  << 8) | buf[IDX_FRAG_ID_LSB];
+    pkt->frag_total     = ((uint32_t)buf[IDX_FRAG_TOT_MSB]  << 16) | ((uint32_t)buf[IDX_FRAG_TOT_MID] << 8) | buf[IDX_FRAG_TOT_LSB];
+    pkt->payload_length = ((uint16_t)buf[IDX_LEN_MSB]       << 8)  |  buf[IDX_LEN_LSB];
 
     uint16_t received_crc = ((uint16_t)buf[IDX_CRC_MSB] << 8) | buf[IDX_CRC_LSB];
 

@@ -35,21 +35,23 @@ except ImportError:
     _PIL_AVAILABLE = False
 
 # ── Protocol constants ──────────────────────────────────────────
-HEADER_SIZE      = 11
+HEADER_SIZE      = 13
 MAX_PACKET_SIZE  = 256
-MAX_PAYLOAD_SIZE = MAX_PACKET_SIZE - HEADER_SIZE  # 245 bytes
+MAX_PAYLOAD_SIZE = MAX_PACKET_SIZE - HEADER_SIZE  # 243 bytes
 
-IDX_TYPE         = 0
-IDX_SEQ_MSB      = 1
-IDX_SEQ_LSB      = 2
-IDX_FRAG_ID_MSB  = 3
-IDX_FRAG_ID_LSB  = 4
-IDX_FRAG_TOT_MSB = 5
-IDX_FRAG_TOT_LSB = 6
-IDX_LEN_MSB      = 7
-IDX_LEN_LSB      = 8
-IDX_CRC_MSB      = 9
-IDX_CRC_LSB      = 10
+IDX_TYPE          = 0
+IDX_SEQ_MSB       = 1
+IDX_SEQ_LSB       = 2
+IDX_FRAG_ID_MSB   = 3   # bits 23-16
+IDX_FRAG_ID_MID   = 4   # bits 15-8
+IDX_FRAG_ID_LSB   = 5   # bits  7-0
+IDX_FRAG_TOT_MSB  = 6   # bits 23-16
+IDX_FRAG_TOT_MID  = 7   # bits 15-8
+IDX_FRAG_TOT_LSB  = 8   # bits  7-0
+IDX_LEN_MSB       = 9
+IDX_LEN_LSB       = 10
+IDX_CRC_MSB       = 11
+IDX_CRC_LSB       = 12
 
 PID_CMD_CONTROL  = 0x10
 PID_PING         = 0x11
@@ -60,6 +62,7 @@ PID_RESUME_REQ   = 0x30
 PID_TELEMETRY_HK = 0x50
 PID_SCI_IMG      = 0x60
 PID_SCI_TXT      = 0x61
+PID_FILE_HDR     = 0x62
 PID_ACK          = 0xAA
 PID_NACK         = 0xBB
 PID_ERROR        = 0xEE
@@ -74,6 +77,7 @@ PACKET_TYPE_NAMES = {
     PID_TELEMETRY_HK: "TELEMETRY_HK",
     PID_SCI_IMG:      "SCI_IMG",
     PID_SCI_TXT:      "SCI_TXT",
+    PID_FILE_HDR:     "FILE_HDR",
     PID_ACK:          "ACK",
     PID_NACK:         "NACK",
     PID_ERROR:        "ERROR",
@@ -104,6 +108,12 @@ _seen_seqs = deque(maxlen=256)
 _last_requested_file      = None
 _last_requested_file_lock = threading.Lock()
 
+# ── Pending file announced by Q7 but not yet fully received ──────
+# Set when FILE_HDR arrives; cleared when the image completes.
+# Used to re-request the file if Q7 restarts before sending any fragments.
+_pending_file      = None
+_pending_file_lock = threading.Lock()
+
 
 # ── Checksum ────────────────────────────────────────────────────
 def calculate_checksum(data: bytes) -> int:
@@ -115,17 +125,19 @@ def _build_control_packet(pkt_type: int, seq_id: int, payload: bytes) -> bytes:
     """Build a single-fragment packet with an explicit seq_id (for ACK/NACK)."""
     chunk_size = len(payload)
     header = bytearray(HEADER_SIZE)
-    header[IDX_TYPE]         = pkt_type
-    header[IDX_SEQ_MSB]      = (seq_id     >> 8) & 0xFF
-    header[IDX_SEQ_LSB]      =  seq_id            & 0xFF
-    header[IDX_FRAG_ID_MSB]  = 0
-    header[IDX_FRAG_ID_LSB]  = 0
-    header[IDX_FRAG_TOT_MSB] = 0
-    header[IDX_FRAG_TOT_LSB] = 1
-    header[IDX_LEN_MSB]      = (chunk_size >> 8) & 0xFF
-    header[IDX_LEN_LSB]      =  chunk_size        & 0xFF
-    header[IDX_CRC_MSB]      = 0
-    header[IDX_CRC_LSB]      = 0
+    header[IDX_TYPE]          = pkt_type
+    header[IDX_SEQ_MSB]       = (seq_id     >> 8) & 0xFF
+    header[IDX_SEQ_LSB]       =  seq_id            & 0xFF
+    header[IDX_FRAG_ID_MSB]   = 0
+    header[IDX_FRAG_ID_MID]   = 0
+    header[IDX_FRAG_ID_LSB]   = 0
+    header[IDX_FRAG_TOT_MSB]  = 0
+    header[IDX_FRAG_TOT_MID]  = 0
+    header[IDX_FRAG_TOT_LSB]  = 1
+    header[IDX_LEN_MSB]       = (chunk_size >> 8) & 0xFF
+    header[IDX_LEN_LSB]       =  chunk_size        & 0xFF
+    header[IDX_CRC_MSB]       = 0
+    header[IDX_CRC_LSB]       = 0
     raw = bytes(header) + payload
     crc = calculate_checksum(raw)
     header[IDX_CRC_MSB] = (crc >> 8) & 0xFF
@@ -138,12 +150,12 @@ def build_ack(seq_id: int) -> bytes:
 
 
 def build_nack(seq_id: int, missing_frags: list) -> bytes:
-    """Build a NACK with the list of missing fragment IDs."""
-    max_frags = (MAX_PAYLOAD_SIZE - 2) // 2   # 121
+    """Build a NACK with the list of missing fragment IDs (3 bytes each)."""
+    max_frags = (MAX_PAYLOAD_SIZE - 2) // 3   # 80
     frags = missing_frags[:max_frags]
     payload = len(frags).to_bytes(2, 'big')
     for fid in frags:
-        payload += fid.to_bytes(2, 'big')
+        payload += fid.to_bytes(3, 'big')
     return _build_control_packet(PID_NACK, seq_id, payload)
 
 
@@ -162,17 +174,19 @@ def build_packets(pkt_type: int, payload: bytes = b'') -> list:
         chunk_size = len(chunk)
 
         header = bytearray(HEADER_SIZE)
-        header[IDX_TYPE]         = pkt_type
-        header[IDX_SEQ_MSB]      = (seq        >> 8) & 0xFF
-        header[IDX_SEQ_LSB]      =  seq               & 0xFF
-        header[IDX_FRAG_ID_MSB]  = (frag_id    >> 8) & 0xFF
-        header[IDX_FRAG_ID_LSB]  =  frag_id           & 0xFF
-        header[IDX_FRAG_TOT_MSB] = (frag_total >> 8) & 0xFF
-        header[IDX_FRAG_TOT_LSB] =  frag_total        & 0xFF
-        header[IDX_LEN_MSB]      = (chunk_size >> 8) & 0xFF
-        header[IDX_LEN_LSB]      =  chunk_size        & 0xFF
-        header[IDX_CRC_MSB]      = 0x00
-        header[IDX_CRC_LSB]      = 0x00
+        header[IDX_TYPE]          = pkt_type
+        header[IDX_SEQ_MSB]       = (seq        >> 8) & 0xFF
+        header[IDX_SEQ_LSB]       =  seq               & 0xFF
+        header[IDX_FRAG_ID_MSB]   = (frag_id    >> 16) & 0xFF
+        header[IDX_FRAG_ID_MID]   = (frag_id    >>  8) & 0xFF
+        header[IDX_FRAG_ID_LSB]   =  frag_id            & 0xFF
+        header[IDX_FRAG_TOT_MSB]  = (frag_total >> 16) & 0xFF
+        header[IDX_FRAG_TOT_MID]  = (frag_total >>  8) & 0xFF
+        header[IDX_FRAG_TOT_LSB]  =  frag_total         & 0xFF
+        header[IDX_LEN_MSB]       = (chunk_size >>  8) & 0xFF
+        header[IDX_LEN_LSB]       =  chunk_size         & 0xFF
+        header[IDX_CRC_MSB]       = 0x00
+        header[IDX_CRC_LSB]       = 0x00
 
         raw = bytes(header) + chunk
         crc = calculate_checksum(raw)
@@ -190,11 +204,11 @@ def parse_packet(data: bytes):
         return None
 
     pkt_type    = data[IDX_TYPE]
-    seq_id      = (data[IDX_SEQ_MSB]      << 8) | data[IDX_SEQ_LSB]
-    frag_id     = (data[IDX_FRAG_ID_MSB]  << 8) | data[IDX_FRAG_ID_LSB]
-    frag_total  = (data[IDX_FRAG_TOT_MSB] << 8) | data[IDX_FRAG_TOT_LSB]
-    payload_len = (data[IDX_LEN_MSB]      << 8) | data[IDX_LEN_LSB]
-    recv_crc    = (data[IDX_CRC_MSB]      << 8) | data[IDX_CRC_LSB]
+    seq_id      = (data[IDX_SEQ_MSB]     << 8) | data[IDX_SEQ_LSB]
+    frag_id     = (data[IDX_FRAG_ID_MSB]  << 16) | (data[IDX_FRAG_ID_MID]  << 8) | data[IDX_FRAG_ID_LSB]
+    frag_total  = (data[IDX_FRAG_TOT_MSB] << 16) | (data[IDX_FRAG_TOT_MID] << 8) | data[IDX_FRAG_TOT_LSB]
+    payload_len = (data[IDX_LEN_MSB]     << 8) | data[IDX_LEN_LSB]
+    recv_crc    = (data[IDX_CRC_MSB]     << 8) | data[IDX_CRC_LSB]
 
     if HEADER_SIZE + payload_len > len(data):
         print("[WARN] Datagram shorter than declared payload length")
@@ -224,8 +238,11 @@ def parse_packet(data: bytes):
 
 
 # ── Image handler ────────────────────────────────────────────────
+RECEIVED_DIR = "received"
+
 def _handle_image(data: bytes, seq_id: int):
-    filename = f"image_{seq_id}.bin"
+    os.makedirs(RECEIVED_DIR, exist_ok=True)
+    filename = os.path.join(RECEIVED_DIR, f"image_{seq_id}.bin")
     with open(filename, 'wb') as f:
         f.write(data)
     print(f"     Saved to {os.path.abspath(filename)}")
@@ -234,6 +251,7 @@ def _handle_image(data: bytes, seq_id: int):
         print("     (install Pillow to display: pip install Pillow)")
         return
     try:
+        # Image.MAX_IMAGE_PIXELS = None  # disable decompression bomb check
         img = Image.open(io.BytesIO(data))
         print(f"     Displaying: {img.width}x{img.height} {img.format}")
         img.show()
@@ -319,12 +337,18 @@ def load_and_resume_partials(sock):
                     frags[frag_id] = f.read()
 
         with _reassembly_lock:
+            if seq_id in _reassembly:
+                # A live transfer with this seq_id is already in progress — don't
+                # overwrite it with stale partial data.
+                print(f"[GS] Skipping partial load for seq={seq_id}: already in progress")
+                continue
             _reassembly[seq_id] = {
                 'total':          frag_total,
                 'type':           meta['pkt_type'],
                 'frags':          frags,
                 'last_frag_time': time.time(),
                 'filename':       filename,
+                'from_partial':   True,
             }
 
         # Remove from _seen_seqs so the reassembled message isn't discarded
@@ -334,9 +358,9 @@ def load_and_resume_partials(sock):
             pass
 
         # Ask Q7 to resume
-        # RESUME_REQ payload: [seq_MSB][seq_LSB][start_frag_MSB][start_frag_LSB][filename]
+        # RESUME_REQ payload: [seq_MSB][seq_LSB][start_frag_B2][start_frag_B1][start_frag_B0][filename]
         resume_payload = (seq_id    .to_bytes(2, 'big') +
-                          start_frag.to_bytes(2, 'big') +
+                          start_frag.to_bytes(3, 'big') +
                           filename.encode())
         send_packet(sock, PID_RESUME_REQ, resume_payload)
 
@@ -384,7 +408,7 @@ def timeout_checker(sock):
 
 # ── Receive thread ───────────────────────────────────────────────
 def receive_loop(sock, q7_port: int):
-    global _q7_addr
+    global _q7_addr, _pending_file
 
     # Packet types that should never be ACKed
     NO_ACK_TYPES = {PID_PING, PID_ACK, PID_NACK, PID_ERROR, PID_RESUME_REQ}
@@ -410,6 +434,9 @@ def receive_loop(sock, q7_port: int):
         pkt = parse_packet(data)
         if pkt is None:
             continue
+        if not pkt['crc_ok']:
+            # Fragment arrived corrupted — discard it; NACK will request a retransmit
+            continue
 
         seq_id     = pkt['seq_id']
         frag_id    = pkt['frag_id']
@@ -424,6 +451,24 @@ def receive_loop(sock, q7_port: int):
                 if pkt_type in (PID_SCI_IMG, PID_SCI_TXT):
                     with _last_requested_file_lock:
                         filename = _last_requested_file
+                _reassembly[seq_id] = {
+                    'total':          frag_total,
+                    'type':           pkt_type,
+                    'frags':          {},
+                    'last_frag_time': time.time(),
+                    'filename':       filename,
+                }
+            elif _reassembly[seq_id]['total'] != frag_total:
+                # Stale partial from a different transfer — discard and restart
+                old_total = _reassembly[seq_id]['total']
+                _cleanup_partial(seq_id)
+                filename = None
+                if pkt_type in (PID_SCI_IMG, PID_SCI_TXT):
+                    with _last_requested_file_lock:
+                        filename = _last_requested_file
+                print(f"\n[GS] Stale partial for seq={seq_id} discarded "
+                      f"(expected {old_total} frags, got {frag_total}) — restarting")
+                print("> ", end='', flush=True)
                 _reassembly[seq_id] = {
                     'total':          frag_total,
                     'type':           pkt_type,
@@ -459,6 +504,31 @@ def receive_loop(sock, q7_port: int):
             sock.sendto(build_ack(seq_id), q7_addr)
             print(f"\n[GS] ACK sent for seq={seq_id}")
 
+        # New pass: Q7 restarted — seq_id wrapped back to an already-seen value
+        if pkt_type == PID_PING and seq_id in _seen_seqs:
+            _seen_seqs.clear()
+            print("\n[GS] Q7 restarted — new pass, cleared sequence history")
+            print("> ", end='', flush=True)
+
+            # Update Q7 address in case it changed
+            with _q7_addr_lock:
+                _q7_addr = (addr[0], q7_port)
+
+            # Save any in-flight transfers to disk and clear reassembly so
+            # load_and_resume_partials can reload and resume them cleanly
+            with _reassembly_lock:
+                inflight = dict(_reassembly)
+                _reassembly.clear()
+            for sid, msg in inflight.items():
+                if msg.get('filename'):
+                    missing = [i for i in range(msg['total'])
+                               if i not in msg['frags']]
+                    if missing:
+                        save_partial(sid, msg)
+
+            threading.Thread(target=load_and_resume_partials,
+                             args=(sock,), daemon=True).start()
+
         # Duplicate detection — discard if we already processed this seq_id
         if seq_id in _seen_seqs:
             print(f"[GS] Duplicate seq={seq_id} — discarded")
@@ -478,6 +548,10 @@ def receive_loop(sock, q7_port: int):
             msg_crc_ok     = (recv_crc32 == computed_crc32)
             full_payload   = full_payload[:-4]  # strip CRC bytes
 
+        # # ── Silently drop periodic beacons — they would interrupt user input ──
+        # if pkt_type in (PID_PING, PID_TELEMETRY_HK):
+        #     continue
+
         # ── Process new message ───────────────────────────────────
         type_name    = PACKET_TYPE_NAMES.get(pkt_type, f"UNKNOWN(0x{pkt_type:02X})")
         frag_crc_str = "OK" if pkt['crc_ok'] else "FAIL"
@@ -487,11 +561,25 @@ def receive_loop(sock, q7_port: int):
               f"len={len(full_payload)}  frag_crc={frag_crc_str}  msg_crc={msg_crc_str}")
 
         if not msg_crc_ok:
-            print("     [!] Message CRC failed — data corrupted, discarding")
+            if msg.get('from_partial'):
+                print("     [!] Message CRC failed — stale partial data; "
+                      "partial deleted, please request the file again")
+            else:
+                print("     [!] Message CRC failed — data corrupted, discarding")
             print("> ", end='', flush=True)
             continue
 
-        if pkt_type == PID_SCI_IMG:
+        if pkt_type == PID_FILE_HDR:
+            # Q7 announces the filename before sending the image — store it
+            announced = full_payload.decode('utf-8', errors='replace').strip()
+            with _last_requested_file_lock:
+                _last_requested_file = announced
+            with _pending_file_lock:
+                _pending_file = announced
+            print(f"     File: {announced}")
+        elif pkt_type == PID_SCI_IMG:
+            with _pending_file_lock:
+                _pending_file = None  # transfer complete — no longer pending
             _handle_image(full_payload, seq_id)
         elif full_payload:
             try:
