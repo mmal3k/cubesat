@@ -410,9 +410,12 @@ def timeout_checker(sock):
                 q7_addr = _q7_addr
 
             if q7_addr is not None:
-                nack_pkt = build_nack(seq_id, missing)
-                sock.sendto(nack_pkt, q7_addr)
-                print(f"\n[GS] NACK seq={seq_id}  missing {len(missing)} frags: "
+                max_per_nack = (MAX_PAYLOAD_SIZE - 2) // 3  # 80
+                for offset in range(0, len(missing), max_per_nack):
+                    batch = missing[offset:offset + max_per_nack]
+                    sock.sendto(build_nack(seq_id, batch), q7_addr)
+                print(f"\n[GS] NACK seq={seq_id}  missing {len(missing)} frags "
+                      f"({(len(missing) + max_per_nack - 1) // max_per_nack} packets): "
                       f"{missing[:10]}{'...' if len(missing) > 10 else ''}")
                 print("> ", end='', flush=True)
 
