@@ -439,7 +439,7 @@ int main(int argc, char *argv[])
                 uint16_t fname_len  = pkt.payload_length - 5;
 
                 char name[MAX_PAYLOAD_SIZE + 1];
-                memcpy(name, pkt.data + 4, fname_len);
+                memcpy(name, pkt.data + 5, fname_len);
                 name[fname_len] = '\0';
 
                 if (strstr(name, "..") != NULL)

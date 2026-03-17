@@ -149,9 +149,13 @@ static int send_one_fragment(PacketType type, uint32_t total_len, uint8_t *data,
 static int send_fragments(PacketType type, uint32_t total_len,
                            uint8_t *data, uint16_t seq) {
     uint32_t ft = frag_total_for(total_len);
-    for (uint32_t fid = 0; fid < ft; fid++)
+    for (uint32_t fid = 0; fid < ft; fid++) {
         if (send_one_fragment(type, total_len, data, seq, fid, ft) < 0)
             return -1;
+        if (ft > 100 && (fid % 1000 == 0 || fid == ft - 1))
+            printf("\r[UDP] Sending seq=%u: %u/%u frags", seq, fid + 1, ft);
+    }
+    if (ft > 100) printf("\n");
     return 0;
 }
 
@@ -256,7 +260,7 @@ void send_data(PacketType type, uint32_t payload_length, uint8_t *data) {
         }
     }
 
-    uint16_t ft = frag_total_for(send_len);
+    uint32_t ft = frag_total_for(send_len);
 
     /* Send all fragments for the first attempt */
     if (send_fragments(type, send_len, send_buf, sequence_id) < 0)
@@ -325,7 +329,7 @@ void send_data_resume(PacketType type, uint32_t payload_length, uint8_t *data,
     crc_buf[payload_length + 3] =  crc        & 0xFF;
     uint32_t send_len = payload_length + 4;
 
-    uint16_t ft = frag_total_for(send_len);
+    uint32_t ft = frag_total_for(send_len);
 
     printf("[UDP] Resuming seq=%u from frag %u/%u\n",
            resume_seq, start_frag, ft);

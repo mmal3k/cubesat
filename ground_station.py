@@ -108,6 +108,17 @@ _seen_seqs = deque(maxlen=256)
 _last_requested_file      = None
 _last_requested_file_lock = threading.Lock()
 
+# Centralized accessors to avoid accidental local shadowing in threads
+def _set_last_requested_file(name: str | None) -> None:
+    global _last_requested_file
+    with _last_requested_file_lock:
+        _last_requested_file = name
+
+
+def _get_last_requested_file() -> str | None:
+    with _last_requested_file_lock:
+        return _last_requested_file
+
 # ── Pending file announced by Q7 but not yet fully received ──────
 # Set when FILE_HDR arrives; cleared when the image completes.
 # Used to re-request the file if Q7 restarts before sending any fragments.
@@ -261,22 +272,30 @@ def _handle_image(data: bytes, seq_id: int):
 
 # ── Partial transfer persistence ────────────────────────────────
 def save_partial(seq_id: int, msg: dict):
-    """Save an incomplete message to disk for resume on next pass."""
+    """Save an incomplete message to disk for resume on next pass.
+
+    Fragments are stored as a single binary blob (seq_XXXXX_frags.bin) where
+    each entry is [2-byte big-endian size][payload].  This replaces the old
+    one-file-per-fragment scheme which became prohibitively slow for large
+    transfers (e.g. 144K files for a 53 MB image).
+    """
     os.makedirs(PARTIAL_DIR, exist_ok=True)
+    sorted_frag_ids = sorted(msg['frags'].keys())
     meta = {
-        'seq_id':        seq_id,
-        'pkt_type':      msg['type'],
-        'frag_total':    msg['total'],
-        'received_frags': sorted(msg['frags'].keys()),
-        'filename':      msg.get('filename'),
+        'seq_id':         seq_id,
+        'pkt_type':       msg['type'],
+        'frag_total':     msg['total'],
+        'received_frags': sorted_frag_ids,
+        'filename':       msg.get('filename'),
     }
     meta_path = os.path.join(PARTIAL_DIR, f'seq_{seq_id:05d}.json')
     with open(meta_path, 'w') as f:
         json.dump(meta, f)
-    for frag_id, data in msg['frags'].items():
-        frag_path = os.path.join(PARTIAL_DIR,
-                                 f'seq_{seq_id:05d}_frag_{frag_id:05d}.bin')
-        with open(frag_path, 'wb') as f:
+    frags_path = os.path.join(PARTIAL_DIR, f'seq_{seq_id:05d}_frags.bin')
+    with open(frags_path, 'wb') as f:
+        for frag_id in sorted_frag_ids:
+            data = msg['frags'][frag_id]
+            f.write(len(data).to_bytes(2, 'big'))
             f.write(data)
     print(f"[GS] Partial saved: seq={seq_id} "
           f"({len(msg['frags'])}/{msg['total']} frags, file={msg.get('filename')})")
@@ -449,8 +468,7 @@ def receive_loop(sock, q7_port: int):
                 # Track filename for file transfers so we can resume them
                 filename = None
                 if pkt_type in (PID_SCI_IMG, PID_SCI_TXT):
-                    with _last_requested_file_lock:
-                        filename = _last_requested_file
+                    filename = _get_last_requested_file()
                 _reassembly[seq_id] = {
                     'total':          frag_total,
                     'type':           pkt_type,
@@ -464,8 +482,7 @@ def receive_loop(sock, q7_port: int):
                 _cleanup_partial(seq_id)
                 filename = None
                 if pkt_type in (PID_SCI_IMG, PID_SCI_TXT):
-                    with _last_requested_file_lock:
-                        filename = _last_requested_file
+                    filename = _get_last_requested_file()
                 print(f"\n[GS] Stale partial for seq={seq_id} discarded "
                       f"(expected {old_total} frags, got {frag_total}) — restarting")
                 print("> ", end='', flush=True)
@@ -481,9 +498,16 @@ def receive_loop(sock, q7_port: int):
             frags_received = len(_reassembly[seq_id]['frags'])
             entry_total    = _reassembly[seq_id]['total']
 
+        # Print progress for large transfers
+        if entry_total > 100 and frags_received % 1000 == 0:
+            print(f"\r[RX] seq={seq_id}: {frags_received}/{entry_total} frags "
+                  f"({100*frags_received//entry_total}%)", end='', flush=True)
+
         # Wait until all fragments of this message have arrived
         if frags_received < entry_total:
             continue
+        if entry_total > 100:
+            print()  # newline after progress line
 
         # ── Full message reassembled ──────────────────────────────
         with _reassembly_lock:
@@ -515,19 +539,51 @@ def receive_loop(sock, q7_port: int):
                 _q7_addr = (addr[0], q7_port)
 
             # Save any in-flight transfers to disk and clear reassembly so
-            # load_and_resume_partials can reload and resume them cleanly
+            # load_and_resume_partials can reload and resume them cleanly.
+            # NOTE: do this in a background thread — save_partial() can write
+            # hundreds of thousands of fragment files and must NOT block the
+            # receive_loop (which needs to ACK Q7's beacon packets promptly).
             with _reassembly_lock:
                 inflight = dict(_reassembly)
                 _reassembly.clear()
-            for sid, msg in inflight.items():
-                if msg.get('filename'):
-                    missing = [i for i in range(msg['total'])
-                               if i not in msg['frags']]
-                    if missing:
-                        save_partial(sid, msg)
 
-            threading.Thread(target=load_and_resume_partials,
-                             args=(sock,), daemon=True).start()
+            def _restart_tasks(inflight_snap):
+                for sid, msg in inflight_snap.items():
+                    if msg.get('filename'):
+                        missing = [i for i in range(msg['total'])
+                                   if i not in msg['frags']]
+                        if missing:
+                            # timeout_checker may have already saved this
+                            # partial — skip the expensive re-write if so.
+                            meta_path = os.path.join(PARTIAL_DIR,
+                                                     f'seq_{sid:05d}.json')
+                            if not os.path.exists(meta_path):
+                                save_partial(sid, msg)
+                load_and_resume_partials(sock)
+
+            threading.Thread(target=_restart_tasks, args=(inflight,),
+                             daemon=True).start()
+
+            # If FILE_HDR was received but Q7 was killed before sending any
+            # fragments, there is no partial to resume — re-request the file
+            with _pending_file_lock:
+                fname = _pending_file
+            if fname:
+                def _partial_has_file(fname):
+                    for p in glob.glob(os.path.join(PARTIAL_DIR, 'seq_*.json')):
+                        try:
+                            with open(p) as mf:
+                                if json.load(mf).get('filename') == fname:
+                                    return True
+                        except Exception:
+                            pass
+                    return False
+                has_partial = _partial_has_file(fname)
+                if not has_partial:
+                    print(f"\n[GS] Re-requesting {fname} (no partial found)")
+                    print("> ", end='', flush=True)
+                    _set_last_requested_file(fname)
+                    send_packet(sock, PID_GET_FILE, fname.encode())
 
         # Duplicate detection — discard if we already processed this seq_id
         if seq_id in _seen_seqs:
@@ -572,8 +628,7 @@ def receive_loop(sock, q7_port: int):
         if pkt_type == PID_FILE_HDR:
             # Q7 announces the filename before sending the image — store it
             announced = full_payload.decode('utf-8', errors='replace').strip()
-            with _last_requested_file_lock:
-                _last_requested_file = announced
+            _set_last_requested_file(announced)
             with _pending_file_lock:
                 _pending_file = announced
             print(f"     File: {announced}")
@@ -627,9 +682,7 @@ def cmd_menu(sock):
 
         elif choice == "3":
             path = input("Enter file path: ").strip()
-            with _last_requested_file_lock:
-                global _last_requested_file
-                _last_requested_file = path
+            _set_last_requested_file(path)
             send_packet(sock, PID_GET_FILE, path.encode())
 
         elif choice == "back":
